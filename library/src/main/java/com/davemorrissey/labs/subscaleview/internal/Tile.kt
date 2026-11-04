@@ -29,9 +29,6 @@ internal class Tile {
 	@JvmField
 	val vRect = Rect()
 
-	@JvmField
-	val fileSRect = Rect()
-
 	fun recycle() {
 		isVisible = false
 		bitmap = null

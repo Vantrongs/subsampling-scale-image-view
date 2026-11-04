@@ -14,6 +14,7 @@ internal class TileMap : LinkedHashMap<Int, List<Tile>>() {
 		for ((_, tiles) in this) {
 			for (tile in tiles) {
 				tile.isValid = false
+				tile.isLoading = false
 			}
 		}
 	}

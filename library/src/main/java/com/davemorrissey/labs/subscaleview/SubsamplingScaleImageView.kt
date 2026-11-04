@@ -95,6 +95,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// Map of zoom level to tile grid
 	private var tileMap: TileMap? = null
 
+	// Whether the full size image is one bitmap from bitmapDecoderFactory rather than tiles
+	private var isWholeImage = false
+
+	// Changes on the main thread whenever loads already started stop being the ones to show: a new image or a new
+	// downSampling. A load keeps the value it started with, and its result is shown only while it is still current, so
+	// a load superseded while it decoded can neither replace a newer result nor have its size read at another sampling.
+	private var loadGeneration = 0
+
+	// The sampling of the image or tiles shown: what the last accepted load was decoded at
 	private var _downSampling = 1
 	public var downSampling: Int = _downSampling
 		set(value) {
@@ -447,9 +456,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						),
 						ORIENTATION_0,
 						false,
+						sampling = 1,
 					)
 				} else {
-					onImageLoaded(imageSource.bitmap, ORIENTATION_0, imageSource.isCached)
+					onImageLoaded(imageSource.bitmap, ORIENTATION_0, imageSource.isCached, sampling = 1)
 				}
 			}
 
@@ -461,6 +471,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						initTiles(regionDecoderFactory, uri)
 					} else {
 						// Load the bitmap as a single image.
+						isWholeImage = true
 						loadBitmap(uri, false)
 					}
 				}
@@ -746,15 +757,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				}
 			}
 		} else if (bitmap != null && !bitmap!!.isRecycled) {
-			var xScale = scale
-			var yScale = scale
-			if (bitmapIsPreview) {
-				xScale = scale * (sWidth.toFloat() / bitmap!!.width)
-				yScale = scale * (sHeight.toFloat() / bitmap!!.height)
-			} else if (_downSampling != 1) {
-				xScale *= _downSampling
-				yScale *= _downSampling
-			}
+			// A preview, or the image decoded at a downSampling, covers the source at its own resolution
+			val xScale = scale * (sWidth.toFloat() / bitmap!!.width)
+			val yScale = scale * (sHeight.toFloat() / bitmap!!.height)
 			if (matrix2 == null) {
 				matrix2 = Matrix()
 			}
@@ -773,12 +778,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				if (sRect == null) {
 					sRect = RectF()
 				}
-				sRect!!.set(
-					0f,
-					0f,
-					(if (bitmapIsPreview) bitmap!!.width else sWidth).toFloat(),
-					(if (bitmapIsPreview) bitmap!!.height else sHeight).toFloat(),
-				)
+				sRect!!.set(0f, 0f, bitmap!!.width.toFloat(), bitmap!!.height.toFloat())
 				matrix2!!.mapRect(sRect)
 				canvas.drawRect(sRect!!, tileBgPaint!!)
 			}
@@ -881,6 +881,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			// Use BitmapDecoder for better image support.
 			decoder?.recycle()
 			decoder = null
+			isWholeImage = true
 			loadBitmap(uri!!, false)
 		} else {
 			initialiseTileMap(maxTileDimensions)
@@ -1004,7 +1005,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						if (y == yTiles - 1) sHeight() else (y + 1) * sTileHeight,
 					)
 					tile.vRect.set(0, 0, 0, 0)
-					tile.fileSRect.set(tile.sRect)
 					tileGrid.add(tile)
 				}
 			}
@@ -1157,6 +1157,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		sRect = null
 		if (isNewImage) {
 			coroutineScope.coroutineContext[Job]?.cancelChildren()
+			loadGeneration++
+			isWholeImage = false
 			uri = null
 			decoderLock.writeLock().lock()
 			try {
@@ -1230,22 +1232,34 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					}
 				} else if (tile.sampleSize == fullImageSampleSize) {
 					tile.isVisible = true
+					// The base layer is drawn under missing tiles, and the image is not drawn until it is complete
+					if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
+						loadTile(decoder!!, tile)
+					}
 				}
 			}
 		}
 	}
 
 	private fun invalidateTiles() {
+		loadGeneration++
+		// Tiles still loading are loaded again at once: what they were loading will not be shown
 		tileMap?.invalidateAll()
-		decoder?.let { _ ->
-			_downSampling = downSampling
-			refreshRequiredTiles(load = true)
-			onDownSamplingChanged()
-		} ?: uri?.let {
-			loadBitmap(it, preview = false)
-		} ?: run {
-			_downSampling = downSampling
-			onDownSamplingChanged()
+		val uri = uri
+		when {
+			decoder != null -> {
+				_downSampling = downSampling
+				refreshRequiredTiles(load = true)
+				onDownSamplingChanged()
+			}
+
+			isWholeImage && uri != null -> loadBitmap(uri, preview = false)
+
+			// No image, a supplied bitmap, or tiles whose decoder is still opening and will load at the new sampling
+			else -> {
+				_downSampling = downSampling
+				onDownSamplingChanged()
+			}
 		}
 	}
 
@@ -1372,11 +1386,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	private fun loadBitmap(source: Uri, preview: Boolean) {
+		val generation = loadGeneration
+		val sampling = downSampling
 		coroutineScope.launch {
 			try {
 				val bitmap = async {
 					runInterruptible(backgroundDispatcher) {
-						bitmapDecoderFactory.make().decode(context, source, downSampling)
+						bitmapDecoderFactory.make().decode(context, source, sampling)
 					}
 				}
 				val orientation = async {
@@ -1384,14 +1400,22 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						getExifOrientation(context, source)
 					}
 				}
+				val result = bitmap.await()
+				val sOrientation = orientation.await()
 				if (preview) {
-					onPreviewLoaded(bitmap.await())
+					// Drawn at the size of the image whatever its sampling, and dropped by a new image's cancellation
+					onPreviewLoaded(result)
+				} else if (generation != loadGeneration) {
+					result.recycle()
 				} else {
-					onImageLoaded(bitmap.await(), orientation.await(), false)
+					onImageLoaded(result, sOrientation, false, sampling)
 				}
 			} catch (e: CancellationException) {
 				throw e
 			} catch (error: Throwable) {
+				if (!preview && generation != loadGeneration) {
+					return@launch
+				}
 				Log.e(TAG, "Failed to load bitmap", error)
 				if (preview) {
 					onImageEventListeners.onPreviewLoadError(error)
@@ -1436,6 +1460,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun loadTile(decoder: ImageRegionDecoder, tile: Tile) {
 		tile.isLoading = true
+		val generation = loadGeneration
+		val map = tileMap
+		val sampleSize = tile.sampleSize * downSampling
+		// A tile of a map that reset() dropped, or loaded for another image or sampling, is not shown
+		fun isCurrent() = generation == loadGeneration && map != null && map === tileMap
 		coroutineScope.launch {
 			try {
 				val bitmap = if (decoder.isReady && tile.isVisible) {
@@ -1443,14 +1472,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						decoderLock.readLock().lock()
 						try {
 							if (decoder.isReady) {
-								// Update tile's file sRect according to rotation
-								fileSRect(tile.sRect, tile.fileSRect)
+								// The tile's rect in the file, according to rotation; its own, since a tile can load
+								// again while a superseded load of it still runs
+								val fileSRect = Rect()
+								fileSRect(tile.sRect, fileSRect)
 								sRegion?.let {
-									tile.fileSRect.offset(it.left, it.top)
+									fileSRect.offset(it.left, it.top)
 								}
-								decoder.decodeRegion(tile.fileSRect, tile.sampleSize * downSampling)
+								decoder.decodeRegion(fileSRect, sampleSize)
 							} else {
-								tile.isLoading = false
 								null
 							}
 						} finally {
@@ -1458,8 +1488,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 						}
 					}
 				} else {
-					tile.isLoading = false
 					null
+				}
+				if (!isCurrent()) {
+					bitmap?.recycle()
+					return@launch
 				}
 				tile.bitmap = bitmap
 				tile.isLoading = false
@@ -1467,7 +1500,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			} catch (e: CancellationException) {
 				throw e
 			} catch (error: Throwable) {
-				onImageEventListeners.onTileLoadError(error)
+				if (isCurrent()) {
+					onImageEventListeners.onTileLoadError(error)
+				}
 			}
 		}
 	}
@@ -1560,9 +1595,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * Called by worker task when full size image bitmap is ready (tiling is disabled).
 	 */
 	@Synchronized
-	private fun onImageLoaded(bitmap: Bitmap, sOrientation: Int, bitmapIsCached: Boolean) {
-		// If actual dimensions don't match the declared size, reset everything.
-		if (sWidth > 0 && sHeight > 0 && (sWidth != bitmap.width * downSampling || sHeight != bitmap.height * downSampling)) {
+	private fun onImageLoaded(bitmap: Bitmap, sOrientation: Int, bitmapIsCached: Boolean, sampling: Int) {
+		// The size known already (declared, or read by the region decoder before it chose one bitmap) is exact; a decode
+		// at a sampling has it divided and rounded either way. If actual dimensions don't match it, reset everything.
+		val isKnownSize = sWidth > 0 && sHeight > 0 &&
+			isSampledSize(sWidth, bitmap.width, sampling) && isSampledSize(sHeight, bitmap.height, sampling)
+		if (sWidth > 0 && sHeight > 0 && !isKnownSize) {
 			reset(false)
 		}
 		this.bitmap?.let { oldBitmap ->
@@ -1575,10 +1613,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		bitmapIsPreview = false
 		this.bitmapIsCached = bitmapIsCached
 		this.bitmap = bitmap
-		val isDownsamplingChanged = _downSampling != downSampling
-		_downSampling = downSampling
-		sWidth = bitmap.fullWidth()
-		sHeight = bitmap.fullHeight()
+		val isDownsamplingChanged = _downSampling != sampling
+		_downSampling = sampling
+		if (!isKnownSize) {
+			sWidth = bitmap.width * sampling
+			sHeight = bitmap.height * sampling
+		}
 		this.sOrientation = sOrientation
 		if (isDownsamplingChanged) {
 			onDownSamplingChanged()
@@ -2065,9 +2105,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun isScaled() = scale > minScale
 
-	private fun Bitmap.fullWidth() = width * _downSampling
-
-	private fun Bitmap.fullHeight() = height * _downSampling
+	private fun isSampledSize(size: Int, sampledSize: Int, sampling: Int) =
+		sampledSize == size / sampling || sampledSize == (size + sampling - 1) / sampling
 
 	/**
 	 * Called once when the view is initialised, has dimensions, and will display an image on the
