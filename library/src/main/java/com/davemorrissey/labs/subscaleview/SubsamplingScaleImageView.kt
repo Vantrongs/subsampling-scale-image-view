@@ -446,18 +446,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			is ImageSource.Bitmap -> {
 				val region = imageSource.region
 				if (region != null) {
-					onImageLoaded(
-						Bitmap.createBitmap(
-							imageSource.bitmap,
-							region.left,
-							region.right,
-							region.width(),
-							region.height(),
-						),
-						ORIENTATION_0,
-						false,
-						sampling = 1,
-					)
+					val source = imageSource.bitmap
+					val crop = Bitmap.createBitmap(source, region.left, region.top, region.width(), region.height())
+					// createBitmap gives the source itself for a region of all of an immutable one
+					val isCropOwn = crop !== source
+					if (isCropOwn && !imageSource.isCached) {
+						source.recycle()
+					}
+					onImageLoaded(crop, ORIENTATION_0, imageSource.isCached && !isCropOwn, sampling = 1)
 				} else {
 					onImageLoaded(imageSource.bitmap, ORIENTATION_0, imageSource.isCached, sampling = 1)
 				}
