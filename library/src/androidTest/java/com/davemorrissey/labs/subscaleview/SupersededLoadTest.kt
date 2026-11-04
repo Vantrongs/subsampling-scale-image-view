@@ -21,10 +21,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * A load superseded by a change of [SubsamplingScaleImageView.downSampling] that finishes after the load that replaced
@@ -99,11 +101,49 @@ public class SupersededLoadTest {
 		}
 	}
 
-	private fun open(source: ImageSource) = onMain {
+	/**
+	 * The region decoder of a replaced image fails to open after the new image shows: an open that does not answer the
+	 * interruption, as BitmapRegionDecoder's native one does not, so the cancelled load resumes with its error.
+	 */
+	@Test
+	public fun initErrorOfAReplacedImageIsNotReported() {
+		val opening = HeldInitRegionDecoder()
+		val errors = mutableListOf<Throwable>()
+		val makes = AtomicInteger()
+		// The replaced image opens with the held decoder, the image replacing it with one that opens at once
+		open(ImageSource.file(file).region(Rect(0, 0, WIDTH, HEIGHT))) {
+			if (makes.getAndIncrement() == 0) opening else HeldRegionDecoder()
+		}
+		onMain {
+			view.addOnImageEventListener(object : DefaultOnImageEventListener {
+				override fun onImageLoadError(e: Throwable) {
+					errors += e
+				}
+			})
+		}
+		assertTrue("the region decoder opens", opening.started.await(10, TimeUnit.SECONDS))
+		onMain { view.setImage(ImageSource.file(file)) }
+		val current = decodes.next(sampleSize = 1, whole = true)
+		current.release()
+		waitFor { shownColor() == current.color }
+
+		opening.fail.countDown()
+		waitFor { opening.isRecycled }
+		onMain { } // what the main thread had queued by then has run
+
+		assertEquals(emptyList<Throwable>(), errors)
+		assertEquals(current.color, shownColor())
+		assertFalse(current.bitmap.isRecycled)
+	}
+
+	private fun open(
+		source: ImageSource,
+		regionDecoder: () -> ImageRegionDecoder = { HeldRegionDecoder() },
+	) = onMain {
 		view = SubsamplingScaleImageView(context).apply {
 			backgroundDispatcher = executor.asCoroutineDispatcher()
 			bitmapDecoderFactory = factory { HeldDecoder() }
-			regionDecoderFactory = factory { HeldRegionDecoder() }
+			regionDecoderFactory = factory(regionDecoder)
 			// The width-fit scale of a webtoon page, at which the whole page is needed at full resolution
 			minimumScaleType = SubsamplingScaleImageView.SCALE_TYPE_CUSTOM
 			minScale = 1f
@@ -151,6 +191,34 @@ public class SupersededLoadTest {
 		override val isReady = true
 
 		override fun recycle() = Unit
+	}
+
+	/** Opens only when the test lets it, then fails, whatever interrupts it meanwhile */
+	private class HeldInitRegionDecoder : ImageRegionDecoder {
+		val started = CountDownLatch(1)
+		val fail = CountDownLatch(1)
+		@Volatile
+		var isRecycled = false
+
+		override fun init(context: Context, uri: Uri): Point {
+			started.countDown()
+			while (true) {
+				try {
+					fail.await()
+					break
+				} catch (_: InterruptedException) {
+				}
+			}
+			throw IOException("cannot open the replaced image")
+		}
+
+		override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap = error("never opened")
+
+		override val isReady = false
+
+		override fun recycle() {
+			isRecycled = true
+		}
 	}
 
 	private inner class Decode(val sampleSize: Int, val isWhole: Boolean, width: Int, height: Int) {

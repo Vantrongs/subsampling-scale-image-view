@@ -103,6 +103,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// a load superseded while it decoded can neither replace a newer result nor have its size read at another sampling.
 	private var loadGeneration = 0
 
+	// Changes on the main thread with each new image only: the opening of the region decoder and a preview belong to the
+	// image, not to a sampling. A coroutine cancelled with its image can still resume with its error (kotlinx-coroutines
+	// does not check cancellation for an exceptional result), so a result is reported only while its image is current.
+	private var imageGeneration = 0
+
 	// The sampling of the image or tiles shown: what the last accepted load was decoded at
 	private var _downSampling = 1
 	public var downSampling: Int = _downSampling
@@ -1154,6 +1159,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (isNewImage) {
 			coroutineScope.coroutineContext[Job]?.cancelChildren()
 			loadGeneration++
+			imageGeneration++
 			isWholeImage = false
 			uri = null
 			decoderLock.writeLock().lock()
@@ -1383,7 +1389,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun loadBitmap(source: Uri, preview: Boolean) {
 		val generation = loadGeneration
+		val image = imageGeneration
 		val sampling = downSampling
+		fun isCurrent() = if (preview) image == imageGeneration else generation == loadGeneration
 		coroutineScope.launch {
 			try {
 				val bitmap = async {
@@ -1398,18 +1406,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				}
 				val result = bitmap.await()
 				val sOrientation = orientation.await()
-				if (preview) {
-					// Drawn at the size of the image whatever its sampling, and dropped by a new image's cancellation
-					onPreviewLoaded(result)
-				} else if (generation != loadGeneration) {
+				if (!isCurrent()) {
 					result.recycle()
+				} else if (preview) {
+					// Drawn at the size of the image whatever its sampling
+					onPreviewLoaded(result)
 				} else {
 					onImageLoaded(result, sOrientation, false, sampling)
 				}
 			} catch (e: CancellationException) {
 				throw e
 			} catch (error: Throwable) {
-				if (!preview && generation != loadGeneration) {
+				if (!isCurrent()) {
 					return@launch
 				}
 				Log.e(TAG, "Failed to load bitmap", error)
@@ -1423,7 +1431,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	private fun initTiles(decoderFactory: DecoderFactory<out ImageRegionDecoder>, source: Uri) {
+		val image = imageGeneration
+		val region = sRegion
 		coroutineScope.launch {
+			// Owned here until onTilesInited takes it: recycled if the image is replaced, cancelled or fails meanwhile
+			var opened: ImageRegionDecoder? = null
 			try {
 				val exifOrientation = async {
 					runInterruptible(backgroundDispatcher) {
@@ -1431,11 +1443,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					}
 				}
 				val (w, h) = runInterruptible(backgroundDispatcher) {
-					decoder = decoderFactory.make()
-					val dimensions = checkNotNull(decoder).init(context, source)
+					val decoder = decoderFactory.make()
+					opened = decoder
+					val dimensions = decoder.init(context, source)
 					var sWidth = dimensions.x
 					var sHeight = dimensions.y
-					sRegion?.also {
+					region?.also {
 						it.left = it.left.coerceAtLeast(0)
 						it.top = it.top.coerceAtLeast(0)
 						it.right = it.right.coerceAtMost(sWidth)
@@ -1445,11 +1458,20 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					}
 					sWidth to sHeight
 				}
-				onTilesInited(checkNotNull(decoder), w, h, exifOrientation.await())
+				val sOrientation = exifOrientation.await()
+				val decoder = checkNotNull(opened)
+				if (image == imageGeneration) {
+					opened = null
+					onTilesInited(decoder, w, h, sOrientation)
+				}
 			} catch (e: CancellationException) {
 				throw e
 			} catch (error: Throwable) {
-				onImageEventListeners.onImageLoadError(error)
+				if (image == imageGeneration) {
+					onImageEventListeners.onImageLoadError(error)
+				}
+			} finally {
+				opened?.recycle()
 			}
 		}
 	}
