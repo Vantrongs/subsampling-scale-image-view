@@ -10,7 +10,7 @@ internal class ClearingLifecycleObserver(
 
 	override fun onDestroy(owner: LifecycleOwner) {
 		super.onDestroy(owner)
-		ssiv.cancelCoroutineScope()
+		ssiv.onOwnerDestroyed()
 		owner.lifecycle.removeObserver(this)
 	}
 }

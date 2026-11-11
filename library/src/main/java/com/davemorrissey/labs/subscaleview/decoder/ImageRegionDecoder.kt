@@ -62,6 +62,14 @@ public interface ImageRegionDecoder {
 	public fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap
 
 	/**
+	 * Whether a region decodes for less than the whole image does, known once [init] returned. The view shows a tall
+	 * image in strips, the ones on screen first, only then: a decoder that decodes the whole image for its first
+	 * region would show nothing sooner and keep the image twice.
+	 */
+	public val decodesRegionsApart: Boolean
+		get() = true
+
+	/**
 	 * Status check. Should return false before initialisation and after recycle.
 	 * @return true if the decoder is ready to be used.
 	 */

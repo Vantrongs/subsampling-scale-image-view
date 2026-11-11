@@ -16,7 +16,6 @@ import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_RES
 import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReadWriteLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import java.util.zip.ZipFile
@@ -32,7 +31,7 @@ import kotlin.concurrent.thread
  *
  *
  * One decoder is initialised when the class is initialised. This is enough to decode base layer tiles.
- * Additional decoders are initialised when a second subregion of the image is requested, which indicates
+ * Additional decoders are initialised when a subregion of the image is first requested, which indicates
  * interaction with the view. Creation of additional encoders stops when [.allowAdditionalDecoder]
  * returns false. The default implementation takes into account the file size, number of CPU cores,
  * low memory status and a hard limit of 4. Extend this class to customise this.
@@ -54,7 +53,6 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private var fileLength = Long.MAX_VALUE
 	private val imageDimensions = Point(0, 0)
 	private val isLazyInited = AtomicBoolean(false)
-	private val partsAsked = AtomicInteger()
 
 	/**
 	 * Initialises the decoder pool. This method creates one decoder on the current thread and uses
@@ -211,8 +209,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	@WorkerThread
 	override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
 		debug("Decode region " + sRect + " on thread " + Thread.currentThread().name)
-		// The second part asked for: one alone is the view's first region, decoded once before the decoder is recycled
-		if ((sRect.width() < imageDimensions.x || sRect.height() < imageDimensions.y) && partsAsked.incrementAndGet() > 1) {
+		if (sRect.width() < imageDimensions.x || sRect.height() < imageDimensions.y) {
 			lazyInit()
 		}
 		decoderLock.readLock().lock()
