@@ -193,7 +193,8 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		imageDimensions[decoder.width] = decoder.height
 		decoderLock.writeLock().lock()
 		try {
-			decoderPool?.add(decoder)
+			// One made for a pool recycled meanwhile, by the thread that fills it, has no other owner
+			decoderPool?.add(decoder) ?: decoder.recycle()
 		} finally {
 			decoderLock.writeLock().unlock()
 		}

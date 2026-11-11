@@ -43,6 +43,7 @@ import com.davemorrissey.labs.subscaleview.internal.ClearingLifecycleObserver
 import com.davemorrissey.labs.subscaleview.internal.CompositeImageEventListener
 import com.davemorrissey.labs.subscaleview.internal.GestureListener
 import com.davemorrissey.labs.subscaleview.internal.InternalErrorHandler
+import com.davemorrissey.labs.subscaleview.internal.RegionDecoderUse
 import com.davemorrissey.labs.subscaleview.internal.ScaleAndTranslate
 import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
@@ -67,7 +68,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.math.ceil
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -195,10 +195,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	public var backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default
 
-	// Tiles decode at most TILE_LOADS at once, in the order they were asked for: a region decoder gives no more than a
-	// few regions at a time and keeps the threads of the rest waiting, which would take every thread of the dispatcher
-	// for an image in many tiles, and the tiles the view shows are asked for first. Made for the dispatcher it limits.
-	private var tileDispatcher: Pair<CoroutineDispatcher, CoroutineDispatcher>? = null
+	// Tiles decode at most TILE_LOADS at once: a region decoder gives no more than a few regions at a time and keeps
+	// the threads of the rest waiting, which would take every thread of the dispatcher for an image in many tiles. The
+	// tiles asked for and not started wait here, and each that starts is the nearest to what the view shows by then
+	// ([startTileLoads]), so the tiles of a place the view moves to go ahead of every tile not started. The count is
+	// the view's, not an image's: a decode of an image dropped holds its thread until it returns.
+	private val waitingTiles = ArrayList<Tile>()
+	private var tileLoadsRunning = 0
 
 	// Whether tiles should be loaded while gestures and animations are still in progress
 	public var isEagerLoadingEnabled: Boolean = true
@@ -286,8 +289,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private var singleDetector: GestureDetector? = null
 
 	// Tile and image decoding
-	private var decoder: ImageRegionDecoder? = null
-	private val decoderLock = ReentrantReadWriteLock(true)
+	// The region decoder of the image while it has tiles to load: opened with the image, ended with the last tile of an
+	// image whose tiles are all of one layer, which nothing the view does decodes more of, and opened again for a
+	// sampling asked for since ([openDecoderAgain]). Ended by the main thread without a wait ([RegionDecoderUse]).
+	private var decoder: RegionDecoderUse? = null
+	private var isDecoderOpening = false
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
 
@@ -900,17 +906,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		) {
 			// Whole image is required at native resolution, and is smaller than the canvas max bitmap size.
 			// Use BitmapDecoder for better image support.
-			opened.recycle()
+			opened.retire()
 			decoder = null
 			isWholeImage = true
 			loadBitmap(uri!!, false)
 		} else {
 			initialiseTileMap(maxTileDimensions, stripRows)
-			val shown = shownSRect()
-			// Those the view shows first, then outwards from them
-			tileMap!![fullImageSampleSize]?.sortedBy { if (shown != null) distance(it.sRect, shown) else 0f }?.forEach {
-				loadTile(opened, it)
-			}
+			tileMap!![fullImageSampleSize]?.forEach(::askForTile)
 			refreshRequiredTiles(load = true)
 		}
 	}
@@ -1007,7 +1009,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 			while (subTileHeight + yTiles + 1 > maxTileDimensions.y ||
 				subTileHeight > height * 1.25 && sampleSize < fullImageSampleSize ||
-				stripRows > 0 && sampleSize == fullImageSampleSize && sTileHeight > stripRows
+				// Strips no shorter than what the view shows, so that it never shows more than two of them
+				stripRows > 0 && sampleSize == fullImageSampleSize && sHeight() / (yTiles + 1) >= stripRows
 			) {
 				yTiles += 1
 				sTileHeight = sHeight() / yTiles
@@ -1185,13 +1188,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			imageGeneration++
 			isWholeImage = false
 			uri = null
-			decoderLock.writeLock().lock()
-			try {
-				decoder?.recycle()
-				decoder = null
-			} finally {
-				decoderLock.writeLock().unlock()
-			}
+			decoder?.retire()
+			decoder = null
+			isDecoderOpening = false
 			bitmap?.let {
 				if (!bitmapIsCached) {
 					it.recycle()
@@ -1212,7 +1211,23 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 		tileMap?.recycleAll()
 		tileMap = null
+		waitingTiles.clear()
+		if (!isNewImage) {
+			// The tiles are laid out anew, by a decoder
+			openDecoderAgain()
+		}
 		setGestureDetector(context)
+	}
+
+	/**
+	 * Opens the region decoder of an image in tiles again where it ended with the last of them: its tiles load at the
+	 * sampling set by then once it is open ([onTilesInited]), and it ends with the last of those.
+	 */
+	private fun openDecoderAgain() {
+		val uri = uri ?: return
+		if (!isWholeImage && decoder == null && !isDecoderOpening) {
+			initTiles(regionDecoderFactory, uri)
+		}
 	}
 
 	private fun restoreState(state: ImageViewState) {
@@ -1252,7 +1267,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					if (tileVisible(tile) || tile.sampleSize == fullImageSampleSize) {
 						tile.isVisible = true
 						if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
-							loadTile(decoder!!, tile)
+							askForTile(tile)
 						}
 					} else {
 						tile.recycle()
@@ -1261,16 +1276,18 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					tile.isVisible = true
 					// The base layer is drawn under missing tiles, and the image is not drawn until it is complete
 					if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
-						loadTile(decoder!!, tile)
+						askForTile(tile)
 					}
 				}
 			}
 		}
+		startTileLoads()
 	}
 
 	private fun invalidateTiles() {
 		loadGeneration++
 		// Tiles still loading are loaded again at once: what they were loading will not be shown
+		waitingTiles.clear()
 		tileMap?.invalidateAll()
 		val uri = uri
 		when {
@@ -1282,8 +1299,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 			isWholeImage && uri != null -> loadBitmap(uri, preview = false)
 
-			// No image, a supplied bitmap, or tiles whose decoder is still opening and will load at the new sampling
+			// No image, a supplied bitmap, or tiles whose decoder is opening, for the first time or again here, and
+			// will load at the new sampling
 			else -> {
+				openDecoderAgain()
 				_downSampling = downSampling
 				onDownSamplingChanged()
 			}
@@ -1409,7 +1428,20 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			bitmapIsPreview = false
 			bitmapIsCached = false
 		}
+		if (isEveryTileLoaded()) {
+			decoder?.retire()
+			decoder = null
+		}
 		invalidate()
+	}
+
+	/**
+	 * Whether the image is in tiles of one layer, all loaded at the sampling set: nothing the view does decodes
+	 * another tile then, until a sampling is set or the tiles are laid out anew.
+	 */
+	private fun isEveryTileLoaded(): Boolean {
+		val tiles = tileMap?.takeIf { it.size == 1 }?.get(fullImageSampleSize) ?: return false
+		return tiles.all { it.bitmap != null && it.isValid && !it.isLoading }
 	}
 
 	private fun loadBitmap(source: Uri, preview: Boolean) {
@@ -1521,7 +1553,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * the image in one piece (a decoder reads the file from its top down to each), which pays only for an image that
 	 * someone waits for.
 	 */
-	private fun stripRows(decoder: ImageRegionDecoder): Int {
+	private fun stripRows(decoder: RegionDecoderUse): Int {
 		val rotation = getRequiredRotation()
 		if (!decoder.decodesRegionsApart || (rotation != ORIENTATION_0 && rotation != ORIENTATION_180) || !isOnScreen()) {
 			return 0
@@ -1533,18 +1565,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	/** Whether the view shows on the screen now: a page laid out beside the one shown, or detached, does not */
 	protected open fun isOnScreen(): Boolean = isShown && getGlobalVisibleRect(Rect())
 
-	private fun distance(sRect: Rect, shown: RectF): Float =
-		maxOf(0f, sRect.left - shown.right, shown.left - sRect.right) +
-			maxOf(0f, sRect.top - shown.bottom, shown.top - sRect.bottom)
-
-	private fun tileDispatcher(): CoroutineDispatcher {
-		val source = backgroundDispatcher
-		tileDispatcher?.let { (limitedSource, limited) ->
-			if (limitedSource === source) {
-				return limited
-			}
-		}
-		return source.limitedParallelism(TILE_LOADS).also { tileDispatcher = source to it }
+	/**
+	 * How far a tile is from what the view shows: under 0 for a tile it shows any of, else the gap between them, which
+	 * is 0 for the tiles beside it.
+	 */
+	private fun distance(sRect: Rect, shown: RectF): Float {
+		val dx = maxOf(sRect.left - shown.right, shown.left - sRect.right)
+		val dy = maxOf(sRect.top - shown.bottom, shown.top - sRect.bottom)
+		return if (dx < 0f && dy < 0f) -1f else maxOf(0f, dx) + maxOf(0f, dy)
 	}
 
 	private fun initTiles(decoderFactory: DecoderFactory<out ImageRegionDecoder>, source: Uri) {
@@ -1553,6 +1581,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		coroutineScope.launch {
 			// Owned here until onTilesInited takes it: recycled if the image is replaced, cancelled or fails meanwhile
 			var opened: ImageRegionDecoder? = null
+			isDecoderOpening = true
 			try {
 				val exifOrientation = async {
 					runInterruptible(backgroundDispatcher) {
@@ -1588,43 +1617,60 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 					onImageEventListeners.onImageLoadError(error)
 				}
 			} finally {
+				if (image == imageGeneration) {
+					isDecoderOpening = false
+				}
 				opened?.recycle()
 			}
 		}
 	}
 
-	private fun loadTile(decoder: ImageRegionDecoder, tile: Tile) {
+	/** Asks for a tile's bitmap: it waits its turn, which [startTileLoads] gives */
+	private fun askForTile(tile: Tile) {
 		tile.isLoading = true
+		waitingTiles.add(tile)
+	}
+
+	/**
+	 * Starts the decodes of the tiles waiting, as many as may run at a time: the nearest to what the view shows first
+	 * ([shownSRect]: where it was last asked to stand), of two as near the one further down an image, which is where
+	 * a reader goes on to. Called when tiles were asked for and when a decode returned, so each tile is chosen by
+	 * where the view is when its decode starts.
+	 */
+	private fun startTileLoads() {
+		val decoder = decoder ?: return
+		while (tileLoadsRunning < TILE_LOADS) {
+			// A tile recycled since it was asked for, of a layer the view no longer shows, is not loaded
+			waitingTiles.removeAll { tile -> (!tile.isVisible).also { if (it) tile.isLoading = false } }
+			val shown = shownSRect()
+			val next = waitingTiles.minWithOrNull(
+				compareBy<Tile> { if (shown != null) distance(it.sRect, shown) else 0f }
+					.thenByDescending { it.sRect.top }
+					.thenByDescending { it.sRect.left },
+			) ?: return
+			waitingTiles.remove(next)
+			loadTile(decoder, next)
+		}
+	}
+
+	private fun loadTile(decoder: RegionDecoderUse, tile: Tile) {
 		val generation = loadGeneration
 		val map = tileMap
 		val sampleSize = tile.sampleSize * downSampling
 		// A tile of a map that reset() dropped, or loaded for another image or sampling, is not shown
 		fun isCurrent() = generation == loadGeneration && map != null && map === tileMap
-		val dispatcher = tileDispatcher()
+		// The tile's rect in the file, according to rotation; its own, since a tile can load again while a superseded
+		// load of it still runs
+		val fileSRect = Rect()
+		fileSRect(tile.sRect, fileSRect)
+		sRegion?.let {
+			fileSRect.offset(it.left, it.top)
+		}
+		tileLoadsRunning++
 		coroutineScope.launch {
 			try {
-				val bitmap = if (decoder.isReady && tile.isVisible) {
-					decodeOn(dispatcher) {
-						decoderLock.readLock().lock()
-						try {
-							if (decoder.isReady) {
-								// The tile's rect in the file, according to rotation; its own, since a tile can load
-								// again while a superseded load of it still runs
-								val fileSRect = Rect()
-								fileSRect(tile.sRect, fileSRect)
-								sRegion?.let {
-									fileSRect.offset(it.left, it.top)
-								}
-								decoder.decodeRegion(fileSRect, sampleSize)
-							} else {
-								null
-							}
-						} finally {
-							decoderLock.readLock().unlock()
-						}
-					}
-				} else {
-					null
+				val bitmap = decodeOn(backgroundDispatcher) {
+					decoder.decodeRegion(fileSRect, sampleSize)
 				}
 				if (!isCurrent()) {
 					bitmap?.recycle()
@@ -1639,6 +1685,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				if (isCurrent()) {
 					onImageEventListeners.onTileLoadError(error)
 				}
+			} finally {
+				// Here only once the decode has returned, whatever became of its image
+				tileLoadsRunning--
+				startTileLoads()
 			}
 		}
 	}
@@ -1661,7 +1711,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			bitmapIsPreview = false
 			bitmapIsCached = false
 		}
-		this.decoder = decoder
+		this.decoder = RegionDecoderUse(decoder)
 		this.sWidth = sWidth
 		this.sHeight = sHeight
 		this.sOrientation = sOrientation
@@ -1671,6 +1721,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		) {
 			initialiseBaseLayer(Point(maxTileWidth, maxTileHeight))
 		}
+		// A decoder opened again loads the tiles that wait for it; one opened first has none yet
+		refreshRequiredTiles(load = true)
 		invalidate()
 		requestLayout()
 	}
