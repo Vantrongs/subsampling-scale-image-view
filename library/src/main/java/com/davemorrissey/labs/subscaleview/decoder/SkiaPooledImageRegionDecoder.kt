@@ -46,24 +46,30 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
 ) : ImageRegionDecoder {
 
-	private var decoderPool: DecoderPool? = DecoderPool()
+	// One pool from the decoder's making to its end, never replaced or cleared: its end is its own state
+	// ([DecoderPool.isRecycled]), so no thread can lose the pool between checking it and using it
+	private val pool = DecoderPool()
 	private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
-	private var context: Context? = null
-	private var uri: Uri? = null
+
+	// What the decoders are opened from; each function reads it once
+	@Volatile
+	private var source: Source? = null
+
+	@Volatile
 	private var fileLength = Long.MAX_VALUE
 	private val imageDimensions = Point(0, 0)
 	private val isLazyInited = AtomicBoolean(false)
 
 	/**
 	 * Initialises the decoder pool. This method creates one decoder on the current thread and uses
-	 * it to decode the bounds, then spawns an independent thread to populate the pool with an
-	 * additional three decoders. The thread will abort if [.recycle] is called.
+	 * it to decode the bounds. An independent thread populates the pool with up to three more once a
+	 * subregion is first requested; it ends when [.recycle] is called.
 	 */
 	@Throws(Exception::class)
 	override fun init(context: Context, uri: Uri): Point {
-		this.context = context
-		this.uri = uri
-		initialiseDecoder()
+		val source = Source(context, uri)
+		this.source = source
+		addDecoder(source)
 		return imageDimensions
 	}
 
@@ -73,42 +79,58 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	 */
 	private fun lazyInit() {
 		if (isLazyInited.compareAndSet(false, true) && fileLength < Long.MAX_VALUE) {
+			val source = source ?: return
 			debug("Starting lazy init of additional decoders")
-			thread(start = true) {
-				while (decoderPool != null && allowAdditionalDecoder(
-						decoderPool!!.size,
-						fileLength,
-					)
-				) {
-					// New decoders can be created while reading tiles but this read lock prevents
-					// them being initialised while the pool is being recycled.
-					try {
-						if (decoderPool != null) {
-							val start = System.currentTimeMillis()
-							debug("Starting decoder")
-							initialiseDecoder()
-							val end = System.currentTimeMillis()
-							debug("Started decoder, took " + (end - start) + "ms")
-						}
-					} catch (e: Exception) {
-						// A decoder has already been successfully created so we can ignore this
-						debug("Failed to start decoder: " + e.message)
-					}
-				}
+			thread(start = true) { fill(source) }
+		}
+	}
+
+	/**
+	 * The thread that fills the pool. It works on the pool and on the [source] it was started with, so [recycle]
+	 * on another thread, at any point of it, takes nothing from under it: all it does once the pool is recycled is
+	 * recycle the decoder it was making ([addDecoder]) and end. It ends too when a decoder fails to open: the pool
+	 * has the one [init] made, and a source that stopped opening (a file deleted) would fail every further turn.
+	 */
+	@WorkerThread
+	private fun fill(source: Source) {
+		while (!pool.isRecycled && allowAdditionalDecoder(pool.size, fileLength)) {
+			try {
+				val start = System.currentTimeMillis()
+				debug("Starting decoder")
+				addDecoder(source)
+				val end = System.currentTimeMillis()
+				debug("Started decoder, took " + (end - start) + "ms")
+			} catch (e: Exception) {
+				debug("Failed to start decoder: " + e.message)
+				return
 			}
 		}
 	}
 
 	/**
-	 * Initialises a new [BitmapRegionDecoder] and adds it to the pool, unless the pool has
-	 * been recycled while it was created.
+	 * Initialises a new [BitmapRegionDecoder] and adds it to the pool; one made for a pool recycled meanwhile has no
+	 * other owner and is recycled here.
 	 */
+	@Throws(Exception::class)
+	@WorkerThread
+	private fun addDecoder(source: Source) {
+		val decoder = open(source)
+		onDecoderOpened(decoder)
+		if (!pool.add(decoder)) {
+			decoder.recycle()
+		}
+	}
+
+	/** Called with each decoder made, by the thread that made it, before the pool is offered it. For tests. */
+	@WorkerThread
+	internal open fun onDecoderOpened(decoder: BitmapRegionDecoder): Unit = Unit
+
 	@SuppressLint("DiscouragedApi")
 	@Throws(Exception::class)
 	@WorkerThread
-	private fun initialiseDecoder() {
-		val uri = checkNotNull(uri)
-		val context = checkNotNull(context)
+	private fun open(source: Source): BitmapRegionDecoder {
+		val uri = source.uri
+		val context = source.context
 		var fileLength = Long.MAX_VALUE
 		val decoder: BitmapRegionDecoder = when (uri.scheme) {
 			URI_SCHEME_RES -> {
@@ -191,20 +213,14 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		} ?: throw ImageDecodeException.create(context, uri)
 		this.fileLength = fileLength
 		imageDimensions[decoder.width] = decoder.height
-		decoderLock.writeLock().lock()
-		try {
-			// One made for a pool recycled meanwhile, by the thread that fills it, has no other owner
-			decoderPool?.add(decoder) ?: decoder.recycle()
-		} finally {
-			decoderLock.writeLock().unlock()
-		}
+		return decoder
 	}
 
 	/**
 	 * Acquire a read lock to prevent decoding overlapping with recycling, then check the pool still
 	 * exists and acquire a decoder to load the requested region. There is no check whether the pool
 	 * currently has decoders, because it's guaranteed to have one decoder after [.init]
-	 * is called and be null once [.recycle] is called. In practice the view can't call this
+	 * is called and none once [.recycle] is called. In practice the view can't call this
 	 * method until after [.init], so there will be no blocking on an empty pool.
 	 */
 	@WorkerThread
@@ -213,21 +229,24 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		if (sRect.width() < imageDimensions.x || sRect.height() < imageDimensions.y) {
 			lazyInit()
 		}
+		val source = source
 		decoderLock.readLock().lock()
 		try {
-			if (decoderPool != null) {
-				val decoder = decoderPool!!.acquire()
+			// Under the read lock the pool is not recycled meanwhile, so the decoder acquired stays whole
+			if (!pool.isRecycled) {
+				val decoder = pool.acquire()
 				try {
 					// Decoder can't be null or recycled in practice
 					if (decoder != null && !decoder.isRecycled) {
 						val options = BitmapFactory.Options()
 						options.inSampleSize = sampleSize
 						options.inPreferredConfig = bitmapConfig
-						return decoder.decodeRegion(sRect, options) ?: throw ImageDecodeException.create(context, uri)
+						return decoder.decodeRegion(sRect, options)
+							?: throw ImageDecodeException.create(source?.context, source?.uri)
 					}
 				} finally {
 					if (decoder != null) {
-						decoderPool?.release(decoder)
+						pool.release(decoder)
 					}
 				}
 			}
@@ -237,26 +256,19 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		}
 	}
 
-	/**
-	 * Holding a read lock to avoid returning true while the pool is being recycled, this returns
-	 * true if the pool has at least one decoder available.
-	 */
-	@get:Synchronized
+	/** Whether the pool has at least one decoder, which a pool recycled has not. */
 	override val isReady: Boolean
-		get() = decoderPool?.isEmpty == false
+		get() = !pool.isEmpty
 
 	/**
-	 * Wait until all read locks held by [.decodeRegion] are released, then recycle
-	 * and destroy the pool. Elsewhere, when a read lock is acquired, we must check the pool is not null.
+	 * Wait until all read locks held by [.decodeRegion] are released, then recycle the pool. The thread that fills
+	 * it is not waited for: the pool refuses what it makes from then on.
 	 */
-	@Synchronized
 	override fun recycle() {
 		decoderLock.writeLock().lock()
 		try {
-			decoderPool?.recycle()
-			decoderPool = null
-			context = null
-			uri = null
+			pool.recycle()
+			source = null
 		} finally {
 			decoderLock.writeLock().unlock()
 		}
@@ -280,7 +292,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		} else if (numberOfDecoders >= numberOfCores) {
 			debug("No additional encoders allowed, limited by CPU cores ($numberOfCores)")
 			return false
-		} else if (context?.isLowMemory() != false) {
+		} else if (source?.context?.isLowMemory() != false) {
 			debug("No additional encoders allowed, memory is low")
 			return false
 		}
@@ -292,6 +304,8 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 
 	private val numberOfCores: Int
 		get() = Runtime.getRuntime().availableProcessors()
+
+	private class Source(val context: Context, val uri: Uri)
 
 	private fun debug(message: String) {
 		if (isDebug) {

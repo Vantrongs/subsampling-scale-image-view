@@ -13,6 +13,14 @@ internal class DecoderPool {
 	private val decoders = ConcurrentHashMap<BitmapRegionDecoder?, Boolean>()
 
 	/**
+	 * Whether [recycle] was called: the pool takes no decoder from then on, so whoever fills it tells from the pool
+	 * itself, not from a reference its owner clears, that its work is over.
+	 */
+	@get:Synchronized
+	var isRecycled: Boolean = false
+		private set
+
+	/**
 	 * Returns false if there is at least one decoder in the pool.
 	 */
 	@get:Synchronized
@@ -44,12 +52,17 @@ internal class DecoderPool {
 	}
 
 	/**
-	 * Adds a newly created decoder to the pool, releasing an additional permit.
+	 * Adds a newly created decoder to the pool, releasing an additional permit. A pool recycled takes none and
+	 * returns false: the decoder stays the caller's, to recycle.
 	 */
 	@Synchronized
-	fun add(decoder: BitmapRegionDecoder?) {
+	fun add(decoder: BitmapRegionDecoder): Boolean {
+		if (isRecycled) {
+			return false
+		}
 		decoders[decoder] = false
 		available.release()
+		return true
 	}
 
 	/**
@@ -61,6 +74,7 @@ internal class DecoderPool {
 	 */
 	@Synchronized
 	fun recycle() {
+		isRecycled = true
 		while (decoders.isNotEmpty()) {
 			val decoder = acquire() ?: continue
 			decoder.recycle()

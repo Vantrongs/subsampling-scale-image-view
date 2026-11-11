@@ -1221,6 +1221,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			openDecoderAgain()
 		}
 		setGestureDetector(context)
+		onPlaceReset()
 	}
 
 	/**
@@ -2344,6 +2345,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	protected open fun onReady(): Unit = Unit
 
 	protected open fun onDownSamplingChanged(): Unit = Unit
+
+	/**
+	 * Called when the view has forgotten the scale and centre it was asked for ([setScaleAndCenter]) and where it
+	 * stood: with every image set, with [recycle], and when the tiles of an image are laid out anew. The image's size
+	 * may be unknown then ([sWidth] 0, until its decoder has opened). A subclass that places an image before it is
+	 * ready places each opening, from here on, once it has its size.
+	 */
+	protected open fun onPlaceReset(): Unit = Unit
 
 	/**
 	 * Called once when the full size image or its base layer tiles have been loaded.
