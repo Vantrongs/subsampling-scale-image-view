@@ -57,6 +57,7 @@ import com.davemorrissey.labs.subscaleview.internal.setMatrixArray
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -67,6 +68,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
 import java.util.Locale
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -97,6 +100,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Whether the full size image is one bitmap from bitmapDecoderFactory rather than tiles
 	private var isWholeImage = false
+
+	// The part of the whole image the view shows first, decoded ahead of the image and drawn until it loads
+	// ([firstRegionRect]); null once the image is there
+	private var firstRegion: Tile? = null
 
 	// Changes on the main thread whenever loads already started stop being the ones to show: a new image or a new
 	// downSampling. A load keeps the value it started with, and its result is shown only while it is still current, so
@@ -663,97 +670,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			for ((key, value) in tiles) {
 				if (key == sampleSize || hasMissingTiles) {
 					for (tile in value) {
-						sourceToViewRect(tile.sRect, tile.vRect)
-						if (tile.bitmap != null) {
-							tileBgPaint?.let {
-								canvas.drawRect(tile.vRect, it)
-							}
-							if (matrix2 == null) {
-								matrix2 = Matrix()
-							}
-							matrix2!!.reset()
-							setMatrixArray(
-								srcArray,
-								0f,
-								0f,
-								tile.bitmap!!.width.toFloat(),
-								0f,
-								tile.bitmap!!.width.toFloat(),
-								tile.bitmap!!.height.toFloat(),
-								0f,
-								tile.bitmap!!.height.toFloat(),
-							)
-							if (getRequiredRotation() == ORIENTATION_0) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_90) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_180) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-								)
-							} else if (getRequiredRotation() == ORIENTATION_270) {
-								setMatrixArray(
-									dstArray,
-									tile.vRect.left.toFloat(),
-									tile.vRect.bottom.toFloat(),
-									tile.vRect.left.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.top.toFloat(),
-									tile.vRect.right.toFloat(),
-									tile.vRect.bottom.toFloat(),
-								)
-							}
-							matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
-							canvas.drawBitmap(tile.bitmap!!, matrix2!!, bitmapPaint)
-							if (isDebugDrawingEnabled) {
-								canvas.drawRect(tile.vRect, debugLinePaint!!)
-							}
-						} else if (tile.isLoading && isDebugDrawingEnabled) {
-							canvas.drawText(
-								"LOADING",
-								(tile.vRect.left + px(5)).toFloat(),
-								(tile.vRect.top + px(35)).toFloat(),
-								debugTextPaint!!,
-							)
-						}
-						if (tile.isVisible && isDebugDrawingEnabled) {
-							canvas.drawText(
-								"ISS ${tile.sampleSize} RECT ${tile.sRect.top},${tile.sRect.left}," +
-									"${tile.sRect.bottom},${tile.sRect.right}",
-								(tile.vRect.left + px(5)).toFloat(),
-								(tile.vRect.top + px(15)).toFloat(),
-								debugTextPaint!!,
-							)
-						}
+						drawTile(canvas, tile)
 					}
 				}
 			}
@@ -785,6 +702,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 			canvas.drawBitmap(bitmap!!, matrix2!!, bitmapPaint)
 		}
+		// Over a preview: the image itself, where it shows first
+		firstRegion?.let { drawTile(canvas, it) }
 		if (isDebugDrawingEnabled) {
 			canvas.drawText(
 				"Scale: " + String.format(Locale.ENGLISH, "%.2f", scale) + " (" + String.format(
@@ -854,6 +773,100 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	private fun drawTile(canvas: Canvas, tile: Tile) {
+		sourceToViewRect(tile.sRect, tile.vRect)
+		if (tile.bitmap != null) {
+			tileBgPaint?.let {
+				canvas.drawRect(tile.vRect, it)
+			}
+			if (matrix2 == null) {
+				matrix2 = Matrix()
+			}
+			matrix2!!.reset()
+			setMatrixArray(
+				srcArray,
+				0f,
+				0f,
+				tile.bitmap!!.width.toFloat(),
+				0f,
+				tile.bitmap!!.width.toFloat(),
+				tile.bitmap!!.height.toFloat(),
+				0f,
+				tile.bitmap!!.height.toFloat(),
+			)
+			if (getRequiredRotation() == ORIENTATION_0) {
+				setMatrixArray(
+					dstArray,
+					tile.vRect.left.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.bottom.toFloat(),
+				)
+			} else if (getRequiredRotation() == ORIENTATION_90) {
+				setMatrixArray(
+					dstArray,
+					tile.vRect.right.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.top.toFloat(),
+				)
+			} else if (getRequiredRotation() == ORIENTATION_180) {
+				setMatrixArray(
+					dstArray,
+					tile.vRect.right.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.top.toFloat(),
+				)
+			} else if (getRequiredRotation() == ORIENTATION_270) {
+				setMatrixArray(
+					dstArray,
+					tile.vRect.left.toFloat(),
+					tile.vRect.bottom.toFloat(),
+					tile.vRect.left.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.top.toFloat(),
+					tile.vRect.right.toFloat(),
+					tile.vRect.bottom.toFloat(),
+				)
+			}
+			matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
+			canvas.drawBitmap(tile.bitmap!!, matrix2!!, bitmapPaint)
+			if (isDebugDrawingEnabled) {
+				canvas.drawRect(tile.vRect, debugLinePaint!!)
+			}
+		} else if (tile.isLoading && isDebugDrawingEnabled) {
+			canvas.drawText(
+				"LOADING",
+				(tile.vRect.left + px(5)).toFloat(),
+				(tile.vRect.top + px(35)).toFloat(),
+				debugTextPaint!!,
+			)
+		}
+		if (tile.isVisible && isDebugDrawingEnabled) {
+			canvas.drawText(
+				"ISS ${tile.sampleSize} RECT ${tile.sRect.top},${tile.sRect.left}," +
+					"${tile.sRect.bottom},${tile.sRect.right}",
+				(tile.vRect.left + px(5)).toFloat(),
+				(tile.vRect.top + px(15)).toFloat(),
+				debugTextPaint!!,
+			)
+		}
+	}
+
 	/**
 	 * Use canvas max bitmap width and height instead of the default 2048, to avoid redundant tiling.
 	 */
@@ -880,9 +893,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (fullImageSampleSize == 1 && sRegion == null && sWidth() < maxTileDimensions.x && sHeight() < maxTileDimensions.y) {
 			// Whole image is required at native resolution, and is smaller than the canvas max bitmap size.
 			// Use BitmapDecoder for better image support.
-			decoder?.recycle()
+			val opened = decoder
 			decoder = null
 			isWholeImage = true
+			val first = if (opened != null) firstRegionRect() else null
+			if (first != null) {
+				loadFirstRegion(checkNotNull(opened), first)
+			} else {
+				opened?.recycle()
+			}
 			loadBitmap(uri!!, false)
 		} else {
 			initialiseTileMap(maxTileDimensions)
@@ -1189,6 +1208,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 		tileMap?.recycleAll()
 		tileMap = null
+		firstRegion?.recycle()
+		firstRegion = null
 		setGestureDetector(context)
 	}
 
@@ -1430,6 +1451,105 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	/**
+	 * The part of the image, as oriented, that the view shows first, when decoding it ahead of the whole image shows
+	 * the image sooner: the view is on screen, and the rows a decoder reads to give that part, those from the top of
+	 * the file down to its end, are at most [FIRST_REGION_MAX_ROWS] of the image's. A tall page opened at its top shows
+	 * a screen of it after a fraction of its decode instead of all of it; a page that fits the view, or one opened
+	 * near its end, would be decoded almost twice for nothing. Null otherwise.
+	 */
+	private fun firstRegionRect(): Rect? {
+		if (!isOnScreen()) {
+			return null
+		}
+		// Where preDraw will put the image on the first draw that shows it: at the place asked for meanwhile, else as
+		// fitToBounds(Boolean) first places it
+		val sat = ScaleAndTranslate(0f, PointF(0f, 0f))
+		val center = sPendingCenter
+		val pending = pendingScale
+		if (center != null && pending != null) {
+			sat.scale = pending
+			sat.vTranslate.set(width / 2f - pending * center.x, height / 2f - pending * center.y)
+			fitToBounds(true, sat)
+		} else {
+			fitToBounds(true, sat)
+			if (minimumScaleType != SCALE_TYPE_START) {
+				sat.vTranslate.set(vTranslateForSCenter(sWidth() / 2f, sHeight() / 2f, sat.scale))
+			}
+		}
+		if (sat.scale <= 0f) {
+			return null
+		}
+		val region = Rect(
+			floor(-sat.vTranslate.x / sat.scale).toInt().coerceIn(0, sWidth()),
+			floor(-sat.vTranslate.y / sat.scale).toInt().coerceIn(0, sHeight()),
+			ceil((width - sat.vTranslate.x) / sat.scale).toInt().coerceIn(0, sWidth()),
+			ceil((height - sat.vTranslate.y) / sat.scale).toInt().coerceIn(0, sHeight()),
+		)
+		if (region.isEmpty) {
+			return null
+		}
+		val inFile = Rect()
+		fileSRect(region, inFile)
+		return region.takeIf { inFile.bottom <= sHeight * FIRST_REGION_MAX_ROWS }
+	}
+
+	/** Whether the view shows on the screen now: a page laid out beside the one shown, or detached, does not */
+	protected open fun isOnScreen(): Boolean = isShown && getGlobalVisibleRect(Rect())
+
+	/**
+	 * Decodes [region] with [decoder], which is this load's from now on and recycled by it, and shows it until the
+	 * whole image, which loads meanwhile, is there. A region that fails to decode only loses the earlier view: the
+	 * image's own load reports what is wrong with the image.
+	 */
+	private fun loadFirstRegion(decoder: ImageRegionDecoder, region: Rect) {
+		val generation = loadGeneration
+		val sampling = downSampling
+		val inFile = Rect()
+		fileSRect(region, inFile)
+		// Runs up to the decode even in a scope cancelled already, so the decoder is always recycled
+		coroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
+			var owned: ImageRegionDecoder? = decoder
+			try {
+				val result = runInterruptible(backgroundDispatcher) {
+					try {
+						decoder.decodeRegion(inFile, sampling)
+					} finally {
+						owned = null
+						decoder.recycle()
+					}
+				}
+				if (generation != loadGeneration || !isWholeImage || (bitmap != null && !bitmapIsPreview)) {
+					result.recycle()
+				} else {
+					onFirstRegionLoaded(region, result)
+				}
+			} catch (e: CancellationException) {
+				throw e
+			} catch (error: Throwable) {
+				Log.w(TAG, "Failed to load the first region", error)
+			} finally {
+				owned?.recycle()
+			}
+		}
+	}
+
+	@Synchronized
+	private fun onFirstRegionLoaded(region: Rect, regionBitmap: Bitmap) {
+		firstRegion = Tile().apply {
+			sampleSize = 1
+			sRect = region
+			bitmap = regionBitmap
+			isVisible = true
+		}
+		val ready = checkReady()
+		val imageLoaded = checkImageLoaded()
+		if (ready || imageLoaded) {
+			invalidate()
+			requestLayout()
+		}
+	}
+
 	private fun initTiles(decoderFactory: DecoderFactory<out ImageRegionDecoder>, source: Uri) {
 		val image = imageGeneration
 		val region = sRegion
@@ -1631,6 +1751,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		bitmapIsPreview = false
 		this.bitmapIsCached = bitmapIsCached
 		this.bitmap = bitmap
+		firstRegion?.recycle()
+		firstRegion = null
 		val isDownsamplingChanged = _downSampling != sampling
 		_downSampling = sampling
 		if (!isKnownSize) {
@@ -1655,7 +1777,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * display an image.
 	 */
 	private fun checkReady(): Boolean {
-		val ready = width > 0 && height > 0 && sWidth > 0 && sHeight > 0 && (bitmap != null || isBaseLayerReady())
+		val ready = width > 0 && height > 0 && sWidth > 0 && sHeight > 0 &&
+			(bitmap != null || isBaseLayerReady() || firstRegion != null)
 		if (!isReadySent && ready) {
 			preDraw()
 			isReadySent = true
@@ -1670,7 +1793,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * loaded event to listener.
 	 */
 	private fun checkImageLoaded(): Boolean {
-		val imageLoaded: Boolean = isBaseLayerReady()
+		// The image shows from its first region on, at full resolution where the view is
+		val imageLoaded: Boolean = isBaseLayerReady() || firstRegion != null
 		if (!imageLoadedSent && imageLoaded) {
 			preDraw()
 			imageLoadedSent = true
@@ -2145,6 +2269,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 		public const val TILE_SIZE_AUTO: Int = Integer.MAX_VALUE
 		internal const val TAG = "SSIV"
+
+		// The share of the image's rows, from the top of its file, that its first region may take to decode
+		private const val FIRST_REGION_MAX_ROWS = 0.5f
 
 		/** Attempt to use EXIF information on the image to rotate it. Works for external files only.  */
 		public const val ORIENTATION_USE_EXIF: Int = -1

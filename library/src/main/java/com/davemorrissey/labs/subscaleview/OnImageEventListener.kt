@@ -14,7 +14,8 @@ public interface OnImageEventListener {
 
 	/**
 	 * Called when the full size image is ready. When using tiling, this means the lowest resolution
-	 * base layer of tiles are loaded, and when tiling is disabled, the image bitmap is loaded.
+	 * base layer of tiles are loaded, and when tiling is disabled, the image bitmap is loaded, or the part of it the
+	 * view shows first while the rest still loads.
 	 * This event could be used as a trigger to enable gestures if you wanted interaction disabled
 	 * while only a preview is displayed, otherwise for most cases [.onReady] is the best
 	 * event to listen to.
