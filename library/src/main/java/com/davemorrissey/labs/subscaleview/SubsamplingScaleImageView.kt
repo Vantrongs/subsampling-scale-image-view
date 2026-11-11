@@ -294,6 +294,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// sampling asked for since ([openDecoderAgain]). Ended by the main thread without a wait ([RegionDecoderUse]).
 	private var decoder: RegionDecoderUse? = null
 	private var isDecoderOpening = false
+
+	// Whether the decoder ended with the last tile: only then is there one to open again, not after an opening failed
+	private var isDecoderEnded = false
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
 
@@ -1191,6 +1194,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			decoder?.retire()
 			decoder = null
 			isDecoderOpening = false
+			isDecoderEnded = false
 			bitmap?.let {
 				if (!bitmapIsCached) {
 					it.recycle()
@@ -1225,7 +1229,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 */
 	private fun openDecoderAgain() {
 		val uri = uri ?: return
-		if (!isWholeImage && decoder == null && !isDecoderOpening) {
+		if (isDecoderEnded && !isDecoderOpening) {
 			initTiles(regionDecoderFactory, uri)
 		}
 	}
@@ -1431,6 +1435,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (isEveryTileLoaded()) {
 			decoder?.retire()
 			decoder = null
+			isDecoderEnded = true
 		}
 		invalidate()
 	}
@@ -1712,6 +1717,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			bitmapIsCached = false
 		}
 		this.decoder = RegionDecoderUse(decoder)
+		isDecoderEnded = false
 		this.sWidth = sWidth
 		this.sHeight = sHeight
 		this.sOrientation = sOrientation

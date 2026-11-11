@@ -24,6 +24,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -50,6 +51,8 @@ public class StripsTest {
 	private val loaded = AtomicInteger()
 	private var decodesRegionsApart = true
 	private var ignoresInterruption = false
+	private var failsToOpen = false
+	private val errors = AtomicInteger()
 	private var imageHeight = HEIGHT
 	private lateinit var view: SubsamplingScaleImageView
 
@@ -195,7 +198,8 @@ public class StripsTest {
 			Thread.sleep(HANDOVER_MS)
 			view.onOwnerDestroyed()
 		}
-		assertEquals("region decoders recycled", 1, recycledDecoders.get())
+		// By the last of the decodes under way, as it returns
+		waitFor { recycledDecoders.get() == 1 }
 		assertTrue("the strip shown is recycled", first.bitmap.isRecycled)
 		waitFor { second.bitmap.isRecycled }
 	}
@@ -237,6 +241,19 @@ public class StripsTest {
 		assertEquals((0 until STRIPS).map(::strip).toSet(), asked.filter { it.sampleSize == 4 }.map { it.rect }.toSet())
 		assertEquals("region decoders opened", 2, openedDecoders.get())
 		waitFor { recycledDecoders.get() == 2 }
+	}
+
+	/** A decoder that failed to open is not opened again for a sampling: its error was told once */
+	@Test
+	public fun aDecoderThatFailedToOpenIsNotOpenedForASampling() {
+		failsToOpen = true
+		open(isOnScreen = true, configure = at(0))
+		waitFor { errors.get() == 1 }
+		onMain { view.downSampling = 2 }
+		Thread.sleep(HANDOVER_MS)
+		onMain { }
+		assertEquals("region decoders opened", 1, openedDecoders.get())
+		assertEquals("load errors", 1, errors.get())
 	}
 
 	/** A sampling changed while strips decode: those are dropped, and the decoder ends when the last of either returns */
@@ -406,7 +423,8 @@ public class StripsTest {
 		open(isOnScreen = true, configure = at(0))
 		val first = decode(0)
 		onMain { view.recycle() }
-		assertEquals("region decoders recycled", 1, recycledDecoders.get())
+		// By its decode, as that returns
+		waitFor { recycledDecoders.get() == 1 }
 		// Its decode, interrupted or not, gives the image nothing
 		first.release()
 		Thread.sleep(HANDOVER_MS)
@@ -528,6 +546,10 @@ public class StripsTest {
 				override fun onImageLoaded() {
 					loaded.incrementAndGet()
 				}
+
+				override fun onImageLoadError(e: Throwable) {
+					errors.incrementAndGet()
+				}
 			})
 			measure(
 				View.MeasureSpec.makeMeasureSpec(WIDTH, View.MeasureSpec.EXACTLY),
@@ -566,6 +588,9 @@ public class StripsTest {
 	private inner class HeldRegionDecoder : ImageRegionDecoder {
 		override fun init(context: Context, uri: Uri): Point {
 			openedDecoders.incrementAndGet()
+			if (failsToOpen) {
+				throw IOException("no image")
+			}
 			return Point(WIDTH, imageHeight)
 		}
 
