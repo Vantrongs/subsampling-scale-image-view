@@ -76,6 +76,12 @@ public interface ImageRegionDecoder {
 	 * next to start is always the one it needs most by then. It may grow while the decoder is used (a pool being
 	 * filled), which [setOnRegionsAtOnceGrown] tells, and does not shrink. A decoder that says nothing decodes one
 	 * region at a time, as one [android.graphics.BitmapRegionDecoder] does.
+	 *
+	 * Every decoder owes both halves of this. The number is that of its whole path: a decoder that wraps another
+	 * answers for its own locks too, and passes on a number no larger than what [decodeRegion] called through it runs
+	 * side by side. And reading it, like [decodesRegionsApart], never waits for a decode: the view reads both on the
+	 * main thread while regions decode, so neither takes a lock that a decode holds or that a waiting decode queues
+	 * for.
 	 */
 	public val regionsAtOnce: Int
 		get() = 1

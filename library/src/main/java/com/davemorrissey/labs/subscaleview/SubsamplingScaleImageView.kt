@@ -201,6 +201,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	// go ahead of every tile not started, and none waits inside a decoder, in the order it came there. The count is the
 	// view's, not an image's: a decode of an image dropped holds its thread until it returns.
 	private val waitingTiles = ArrayList<Tile>()
+
+	// Where a tile would be drawn at the place asked about ([drawnRect]); the main thread's, read at once
+	private val placeRect = Rect()
 	private var tileLoadsRunning = 0
 
 	// Whether tiles should be loaded while gestures and animations are still in progress
@@ -792,14 +795,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Draws a tile into its rectangle of the view, whose edges are whole pixels ([sourceToViewRect]) and the same
+	 * Draws a tile into its rectangle of the view, whose edges are whole pixels ([drawnRect]) and the same
 	 * numbers as the edges of the tiles beside it, which end at the source rows and columns it begins at. An image as
 	 * it lies in its file is drawn straight into that rectangle; a matrix made from its corners puts an edge a
 	 * fraction of a pixel off (single precision: 1875 rows drawn 2530 px tall end at 2530.0002), and such a tile is
 	 * drawn apart from its neighbours, by another GPU program.
 	 */
 	private fun drawTile(canvas: Canvas, tile: Tile) {
-		sourceToViewRect(tile.sRect, tile.vRect)
+		val translate = vTranslate ?: return
+		drawnRect(tile.sRect, scale, translate, tile.vRect)
 		val bitmap = tile.bitmap
 		if (bitmap != null) {
 			tileBgPaint?.let {
@@ -1089,22 +1093,35 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Convert source rect to screen rect: each edge the whole pixel nearest to where it stands, so tiles that share
-	 * an edge of the source share it on the screen, and an image that ends at the view's edge ends on it, not a pixel
-	 * short where single precision put it a fraction inside (a 1110 px wide page on a 1220 px wide view: 1219.9999).
+	 * Where a tile is drawn in a view that stands at [scale] and [translate]: each edge the whole pixel nearest to
+	 * where it stands, so tiles that share an edge of the source share it on the screen, and an image that ends at the
+	 * view's edge ends on it, not a pixel short where single precision put it a fraction inside (a 1110 px wide page on
+	 * a 1220 px wide view: 1219.9999). The one place that says where a tile is: the drawing ([drawTile]) and every
+	 * question of whether the view shows a tile ([isInViewport]) read it, so a tile counts as shown exactly where it
+	 * draws a pixel. Told from the source rows instead, a strip whose edge stands a quarter of a pixel inside the view
+	 * counted as shown while it drew nothing, and the image waited for its decode.
 	 */
-	private fun sourceToViewRect(sRect: Rect, vTarget: Rect) {
-		val translate = vTranslate
-		if (translate == null) {
-			vTarget.setEmpty()
-			return
-		}
+	private fun drawnRect(sRect: Rect, scale: Float, translate: PointF, vTarget: Rect) {
 		vTarget.set(
 			(sRect.left * scale + translate.x).roundToInt(),
 			(sRect.top * scale + translate.y).roundToInt(),
 			(sRect.right * scale + translate.x).roundToInt(),
 			(sRect.bottom * scale + translate.y).roundToInt(),
 		)
+	}
+
+	/** Whether a tile drawn at [vRect] ([drawnRect]) draws any pixel of the view */
+	private fun isInViewport(vRect: Rect): Boolean =
+		!vRect.isEmpty && vRect.left < width && vRect.right > 0 && vRect.top < height && vRect.bottom > 0
+
+	/**
+	 * How far a tile drawn at [vRect] is from the view, in its pixels: under 0 for a tile the view shows any of, else
+	 * the gap between them, which is 0 for the tiles beside it.
+	 */
+	private fun gapToViewport(vRect: Rect): Int = if (isInViewport(vRect)) {
+		-1
+	} else {
+		maxOf(vRect.left - width, -vRect.right, 0) + maxOf(vRect.top - height, -vRect.bottom, 0)
 	}
 
 	/**
@@ -1233,6 +1250,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 		val tiles = tileMap?.values ?: return
 		val sampleSize = minOf(fullImageSampleSize, calculateInSampleSize(scale))
+		val place = shownPlace()
 
 		// Load tiles of the correct sample size that are on screen. Discard tiles off-screen, and those that are higher
 		// resolution than required, or lower res than required but not the base layer, so the base layer is always present.
@@ -1245,7 +1263,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				if (tile.sampleSize == sampleSize) {
 					// The base layer whole, also where it is the layer shown: a strip the view comes to later is there
 					// already, at the sampling asked for since
-					if (tileVisible(tile) || tile.sampleSize == fullImageSampleSize) {
+					if (tile.sampleSize == fullImageSampleSize || tileVisible(tile, place)) {
 						tile.isVisible = true
 						if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
 							askForTile(tile)
@@ -1291,15 +1309,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Determine whether tile is visible.
+	 * Whether the view shows any of a tile where it stands ([shownPlace]); every tile while it stands nowhere yet.
 	 */
-	private fun tileVisible(tile: Tile): Boolean {
-		val sVisLeft = viewToSourceX(0f)
-		val sVisRight = viewToSourceX(width.toFloat())
-		val sVisTop = viewToSourceY(0f)
-		val sVisBottom = viewToSourceY(height.toFloat())
-		val sRect = tile.sRect
-		return !(sVisLeft > sRect.right || sRect.left > sVisRight || sVisTop > sRect.bottom || sRect.top > sVisBottom)
+	private fun tileVisible(tile: Tile, place: ScaleAndTranslate?): Boolean {
+		place ?: return true
+		drawnRect(tile.sRect, place.scale, place.vTranslate, placeRect)
+		return isInViewport(placeRect)
 	}
 
 	/**
@@ -1491,11 +1506,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * The part of the image, as oriented, that the view shows: at the place asked for, which the next draw takes
-	 * ([preDraw]), else where it stands, else where its first draw will put it. Null while the view or the image has no
-	 * size.
+	 * Where the view shows the image: at the place asked for, which the next draw takes ([preDraw]), else where it
+	 * stands, else where its first draw will put it. Null while the view or the image has no size.
 	 */
-	private fun shownSRect(): RectF? {
+	private fun shownPlace(): ScaleAndTranslate? {
 		if (width == 0 || height == 0 || sWidth <= 0 || sHeight <= 0) {
 			return null
 		}
@@ -1516,15 +1530,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				sat.vTranslate.set(vTranslateForSCenter(sWidth() / 2f, sHeight() / 2f, sat.scale))
 			}
 		}
-		if (sat.scale <= 0f) {
-			return null
-		}
-		return RectF(
-			-sat.vTranslate.x / sat.scale,
-			-sat.vTranslate.y / sat.scale,
-			(width - sat.vTranslate.x) / sat.scale,
-			(height - sat.vTranslate.y) / sat.scale,
-		)
+		return sat.takeIf { it.scale > 0f }
 	}
 
 	/**
@@ -1540,22 +1546,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (!decoder.decodesRegionsApart || (rotation != ORIENTATION_0 && rotation != ORIENTATION_180) || !isOnScreen()) {
 			return 0
 		}
-		val rows = ceil((shownSRect() ?: return 0).height()).toInt()
+		val rows = ceil(height / (shownPlace() ?: return 0).scale).toInt()
 		return if (rows > 0 && sHeight() >= rows * STRIPS_MIN_SCREENS) rows else 0
 	}
 
 	/** Whether the view shows on the screen now: a page laid out beside the one shown, or detached, does not */
 	protected open fun isOnScreen(): Boolean = isShown && getGlobalVisibleRect(Rect())
-
-	/**
-	 * How far a tile is from what the view shows: under 0 for a tile it shows any of, else the gap between them, which
-	 * is 0 for the tiles beside it.
-	 */
-	private fun distance(sRect: Rect, shown: RectF): Float {
-		val dx = maxOf(sRect.left - shown.right, shown.left - sRect.right)
-		val dy = maxOf(sRect.top - shown.bottom, shown.top - sRect.bottom)
-		return if (dx < 0f && dy < 0f) -1f else maxOf(0f, dx) + maxOf(0f, dy)
-	}
 
 	private fun initTiles(decoderFactory: DecoderFactory<out ImageRegionDecoder>, source: Uri) {
 		val image = imageGeneration
@@ -1615,7 +1611,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	/**
 	 * Starts the decodes of the tiles waiting, as many as the decoder can decode at once now: the nearest to what the
-	 * view shows first ([shownSRect]: where it was last asked to stand), of two as near the one further down an image,
+	 * view shows first ([shownPlace]: where it was last asked to stand), of two as near the one further down an image,
 	 * which is where a reader goes on to. Called when tiles were asked for, when a decode returned and when the decoder
 	 * can decode more at once than before, so each tile is chosen by where the view is when its decode can begin, and
 	 * a place the view moves to waits for one decode under way, then for its own.
@@ -1625,9 +1621,16 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		while (tileLoadsRunning < TILE_LOADS && decoder.canStartLoad) {
 			// A tile recycled since it was asked for, of a layer the view no longer shows, is not loaded
 			waitingTiles.removeAll { tile -> (!tile.isVisible).also { if (it) tile.isLoading = false } }
-			val shown = shownSRect()
+			val place = shownPlace()
 			val next = waitingTiles.minWithOrNull(
-				compareBy<Tile> { if (shown != null) distance(it.sRect, shown) else 0f }
+				compareBy<Tile> {
+					if (place != null) {
+						drawnRect(it.sRect, place.scale, place.vTranslate, placeRect)
+						gapToViewport(placeRect)
+					} else {
+						0
+					}
+				}
 					.thenByDescending { it.sRect.top }
 					.thenByDescending { it.sRect.left },
 			) ?: return
@@ -1762,16 +1765,16 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Whether the tiles of the base layer that the view shows ([shownSRect]) are all loaded, as far as it shows any:
-	 * from then on the image shows, and counts as loaded, though the rest of the layer still loads.
+	 * Whether the tiles of the base layer that the view shows ([shownPlace], [isInViewport]) are all loaded, as far
+	 * as it shows any: from then on the image shows, and counts as loaded, though the rest of the layer still loads.
 	 */
 	private fun isBaseLayerShown(): Boolean {
 		val base = tileMap?.get(fullImageSampleSize) ?: return false
-		val shown = shownSRect() ?: return false
+		val place = shownPlace() ?: return false
 		var showsAny = false
 		for (tile in base) {
-			val rect = tile.sRect
-			if (rect.left < shown.right && rect.right > shown.left && rect.top < shown.bottom && rect.bottom > shown.top) {
+			drawnRect(tile.sRect, place.scale, place.vTranslate, placeRect)
+			if (isInViewport(placeRect)) {
 				if (tile.bitmap == null) {
 					return false
 				}

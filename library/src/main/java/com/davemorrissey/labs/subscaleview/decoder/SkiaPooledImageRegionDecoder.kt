@@ -142,9 +142,12 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	@WorkerThread
 	internal open fun onDecoderOpened(decoder: BitmapRegionDecoder): Unit = Unit
 
-	/** Called by a thread that has taken a decoder of the pool for [sRect], before it decodes. For tests. */
+	/**
+	 * Called by a thread that has taken a decoder of the pool for [sRect], before it decodes. For a subclass that
+	 * watches or holds the decodes, as a test does.
+	 */
 	@WorkerThread
-	internal open fun onRegionDecoding(sRect: Rect): Unit = Unit
+	protected open fun onRegionDecoding(sRect: Rect): Unit = Unit
 
 	@SuppressLint("DiscouragedApi")
 	@Throws(Exception::class)

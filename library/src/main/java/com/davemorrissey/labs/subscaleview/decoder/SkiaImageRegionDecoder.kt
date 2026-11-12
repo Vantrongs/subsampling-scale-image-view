@@ -28,11 +28,12 @@ import java.util.zip.ZipFile
  * tiles are being loaded before recycling the decoder. In practice, [BitmapRegionDecoder] is
  * synchronized internally so this has no real impact on performance.
  */
-public class SkiaImageRegionDecoder @JvmOverloads constructor(
+public open class SkiaImageRegionDecoder @JvmOverloads constructor(
 	private val bitmapConfig: Bitmap.Config = Bitmap.Config.RGB_565,
 ) : ImageRegionDecoder {
 
 	private var decoder: BitmapRegionDecoder? = null
+	private val decodeMonitor = Any()
 	private val decoderLock: ReadWriteLock = ReentrantReadWriteLock(true)
 
 	@SuppressLint("DiscouragedApi")
@@ -103,12 +104,22 @@ public class SkiaImageRegionDecoder @JvmOverloads constructor(
 			val options = BitmapFactory.Options()
 			options.inSampleSize = sampleSize
 			options.inPreferredConfig = bitmapConfig
-			decoder?.decodeRegion(sRect, options)
-				?: error("Skia image decoder returned null bitmap - image format may not be supported")
+			// One region at a time, as BitmapRegionDecoder itself decodes them
+			synchronized(decodeMonitor) {
+				onRegionDecoding(sRect)
+				decoder?.decodeRegion(sRect, options)
+			} ?: error("Skia image decoder returned null bitmap - image format may not be supported")
 		} finally {
 			decodeLock.unlock()
 		}
 	}
+
+	/**
+	 * Called by the thread whose turn it is to decode [sRect], before it decodes: the next region waits until it
+	 * returns. For a subclass that watches or holds the decodes, as a test does.
+	 */
+	@WorkerThread
+	protected open fun onRegionDecoding(sRect: Rect): Unit = Unit
 
 	@get:Synchronized
 	override val isReady: Boolean
