@@ -188,6 +188,9 @@ public class SupersededLoadTest {
 		override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap =
 			Decode(sampleSize, isWhole = false, sRect.width() / sampleSize, sRect.height() / sampleSize).await()
 
+		// As a pool with a decoder free beside the one a superseded load still holds
+		override val regionsAtOnce: Int = 2
+
 		override val isReady = true
 
 		override fun recycle() = Unit

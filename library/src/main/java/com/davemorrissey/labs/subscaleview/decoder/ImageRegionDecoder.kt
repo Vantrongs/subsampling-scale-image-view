@@ -70,6 +70,23 @@ public interface ImageRegionDecoder {
 		get() = true
 
 	/**
+	 * How many regions the decoder decodes at the same time now, known once [init] returned and at least 1 while it is
+	 * ready: a [decodeRegion] called beyond that waits inside the decoder for one under way, in an order its caller
+	 * cannot change. The view starts no more decodes than this at a time and keeps the rest waiting itself, so the
+	 * next to start is always the one it needs most by then. It may grow while the decoder is used (a pool being
+	 * filled), which [setOnRegionsAtOnceGrown] tells, and does not shrink. A decoder that says nothing decodes one
+	 * region at a time, as one [android.graphics.BitmapRegionDecoder] does.
+	 */
+	public val regionsAtOnce: Int
+		get() = 1
+
+	/**
+	 * Sets what is called, on any thread, each time [regionsAtOnce] has grown; a decoder whose number never changes
+	 * calls nothing. A decoder that wraps another passes both on.
+	 */
+	public fun setOnRegionsAtOnceGrown(listener: (() -> Unit)?): Unit = Unit
+
+	/**
 	 * Status check. Should return false before initialisation and after recycle.
 	 * @return true if the decoder is ready to be used.
 	 */

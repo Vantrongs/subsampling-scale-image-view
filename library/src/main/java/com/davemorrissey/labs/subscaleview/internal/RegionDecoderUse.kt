@@ -11,10 +11,26 @@ import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
  * and that one recycles it, on its thread; ended while none runs, it is recycled at once. No decode starts in a
  * decoder ended, so a decoder is never recycled under a decode and never used after.
  */
-internal class RegionDecoderUse(private val decoder: ImageRegionDecoder) {
+internal class RegionDecoderUse(private val decoder: ImageRegionDecoder, onCanDecodeMore: () -> Unit) {
 
 	private var decoding = 0
 	private var isRetired = false
+
+	/** The view's loads started in this decoder and not returned, the ones it dropped included; the main thread's */
+	var loads = 0
+
+	init {
+		decoder.setOnRegionsAtOnceGrown(onCanDecodeMore)
+	}
+
+	/**
+	 * Whether a load started now is decoded at once: the decoder decodes more regions at a time than the view has
+	 * loads in it. One started beyond that would wait inside the decoder behind those that came before it, where
+	 * the view cannot put a tile it needs sooner ahead of it. A count read before the decoder grew only starts fewer;
+	 * the decoder tells when it has grown.
+	 */
+	val canStartLoad: Boolean
+		get() = loads < decoder.regionsAtOnce
 
 	val decodesRegionsApart: Boolean
 		get() = decoder.decodesRegionsApart
@@ -47,6 +63,8 @@ internal class RegionDecoderUse(private val decoder: ImageRegionDecoder) {
 			isRetired = true
 			decoding == 0
 		}
+		// Nothing more starts in it, whatever it can decode at once from now on
+		decoder.setOnRegionsAtOnceGrown(null)
 		if (isIdle) {
 			decoder.recycle()
 		}

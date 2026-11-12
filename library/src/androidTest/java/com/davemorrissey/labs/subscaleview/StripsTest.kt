@@ -141,8 +141,11 @@ public class StripsTest {
 		assertEquals("a decoder recycled under its decode", 0, recycledDecoders.get())
 		assertFalse(first.bitmap.isRecycled)
 		assertFalse(first.isTaken)
-		asked.forEach { it.release() }
-		waitFor { recycledDecoders.get() == 1 }
+		// A decode whose thread had started when its coroutine was cancelled may reach the decoder only now
+		waitFor {
+			asked.forEach { it.release() }
+			recycledDecoders.get() == 1
+		}
 		waitFor { asked.all { it.bitmap.isRecycled } }
 		assertEquals("region decoders recycled", 1, recycledDecoders.get())
 		assertEquals("image loaded events", 0, loaded.get())
@@ -599,6 +602,9 @@ public class StripsTest {
 
 		override val decodesRegionsApart: Boolean
 			get() = this@StripsTest.decodesRegionsApart
+
+		override val regionsAtOnce: Int
+			get() = TILE_LOADS
 
 		override val isReady = true
 

@@ -60,6 +60,9 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private val imageDimensions = Point(0, 0)
 	private val isLazyInited = AtomicBoolean(false)
 
+	@Volatile
+	private var onRegionsAtOnceGrown: (() -> Unit)? = null
+
 	/**
 	 * Initialises the decoder pool. This method creates one decoder on the current thread and uses
 	 * it to decode the bounds. An independent thread populates the pool with up to three more once a
@@ -116,14 +119,32 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 	private fun addDecoder(source: Source) {
 		val decoder = open(source)
 		onDecoderOpened(decoder)
-		if (!pool.add(decoder)) {
+		if (pool.add(decoder)) {
+			onRegionsAtOnceGrown?.invoke()
+		} else {
 			decoder.recycle()
 		}
+	}
+
+	/**
+	 * The decoders in the pool: one from [init] on, and only that one for a source whose length is not known (an entry
+	 * of a ZIP), while the pool is still being filled, where a decoder failed to open or [allowAdditionalDecoder]
+	 * refused another. A region asked for beyond them waits for a decoder in the order it came.
+	 */
+	override val regionsAtOnce: Int
+		get() = pool.size
+
+	override fun setOnRegionsAtOnceGrown(listener: (() -> Unit)?) {
+		onRegionsAtOnceGrown = listener
 	}
 
 	/** Called with each decoder made, by the thread that made it, before the pool is offered it. For tests. */
 	@WorkerThread
 	internal open fun onDecoderOpened(decoder: BitmapRegionDecoder): Unit = Unit
+
+	/** Called by a thread that has taken a decoder of the pool for [sRect], before it decodes. For tests. */
+	@WorkerThread
+	internal open fun onRegionDecoding(sRect: Rect): Unit = Unit
 
 	@SuppressLint("DiscouragedApi")
 	@Throws(Exception::class)
@@ -241,6 +262,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 						val options = BitmapFactory.Options()
 						options.inSampleSize = sampleSize
 						options.inPreferredConfig = bitmapConfig
+						onRegionDecoding(sRect)
 						return decoder.decodeRegion(sRect, options)
 							?: throw ImageDecodeException.create(source?.context, source?.uri)
 					}
@@ -269,6 +291,7 @@ public open class SkiaPooledImageRegionDecoder @JvmOverloads constructor(
 		try {
 			pool.recycle()
 			source = null
+			onRegionsAtOnceGrown = null
 		} finally {
 			decoderLock.writeLock().unlock()
 		}

@@ -195,11 +195,11 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	public var backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default
 
-	// Tiles decode at most TILE_LOADS at once: a region decoder gives no more than a few regions at a time and keeps
-	// the threads of the rest waiting, which would take every thread of the dispatcher for an image in many tiles. The
-	// tiles asked for and not started wait here, and each that starts is the nearest to what the view shows by then
-	// ([startTileLoads]), so the tiles of a place the view moves to go ahead of every tile not started. The count is
-	// the view's, not an image's: a decode of an image dropped holds its thread until it returns.
+	// A tile's decode starts only when its decoder can decode it at once ([RegionDecoderUse.canStartLoad]), and at most
+	// TILE_LOADS run at a time. The tiles asked for and not started wait here, the one place that orders them: each that
+	// starts is the nearest to what the view shows by then ([startTileLoads]), so the tiles of a place the view moves to
+	// go ahead of every tile not started, and none waits inside a decoder, in the order it came there. The count is the
+	// view's, not an image's: a decode of an image dropped holds its thread until it returns.
 	private val waitingTiles = ArrayList<Tile>()
 	private var tileLoadsRunning = 0
 
@@ -363,6 +363,10 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Paint objects created once and reused for efficiency
 	private var bitmapPaint: Paint? = null
+
+	// Tiles are drawn without anti-aliasing: their edges are whole pixels of the view, where it does nothing, and on a
+	// canvas scaled by a parent it would blend each of two tiles that meet with what is under them, a line at the seam
+	private var tilePaint: Paint? = null
 	private var debugTextPaint: Paint? = null
 	private var debugLinePaint: Paint? = null
 	private var tileBgPaint: Paint? = null
@@ -371,6 +375,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		set(value) {
 			field = value
 			bitmapPaint?.colorFilter = value
+			tilePaint?.colorFilter = value
 		}
 
 	private var pendingState: ImageViewState? = null
@@ -505,6 +510,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	public open fun recycle() {
 		reset(true)
 		bitmapPaint = null
+		tilePaint = null
 		debugTextPaint = null
 		debugLinePaint = null
 		tileBgPaint = null
@@ -785,78 +791,41 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		}
 	}
 
+	/**
+	 * Draws a tile into its rectangle of the view, whose edges are whole pixels ([sourceToViewRect]) and the same
+	 * numbers as the edges of the tiles beside it, which end at the source rows and columns it begins at. An image as
+	 * it lies in its file is drawn straight into that rectangle; a matrix made from its corners puts an edge a
+	 * fraction of a pixel off (single precision: 1875 rows drawn 2530 px tall end at 2530.0002), and such a tile is
+	 * drawn apart from its neighbours, by another GPU program.
+	 */
 	private fun drawTile(canvas: Canvas, tile: Tile) {
 		sourceToViewRect(tile.sRect, tile.vRect)
-		if (tile.bitmap != null) {
+		val bitmap = tile.bitmap
+		if (bitmap != null) {
 			tileBgPaint?.let {
 				canvas.drawRect(tile.vRect, it)
 			}
-			if (matrix2 == null) {
-				matrix2 = Matrix()
+			val rotation = getRequiredRotation()
+			if (rotation == ORIENTATION_0) {
+				canvas.drawBitmap(bitmap, null, tile.vRect, tilePaint)
+			} else {
+				val matrix = matrix2 ?: Matrix().also { matrix2 = it }
+				matrix.reset()
+				val w = bitmap.width.toFloat()
+				val h = bitmap.height.toFloat()
+				setMatrixArray(srcArray, 0f, 0f, w, 0f, w, h, 0f, h)
+				val l = tile.vRect.left.toFloat()
+				val t = tile.vRect.top.toFloat()
+				val r = tile.vRect.right.toFloat()
+				val b = tile.vRect.bottom.toFloat()
+				when (rotation) {
+					ORIENTATION_90 -> setMatrixArray(dstArray, r, t, r, b, l, b, l, t)
+					ORIENTATION_180 -> setMatrixArray(dstArray, r, b, l, b, l, t, r, t)
+					else -> setMatrixArray(dstArray, l, b, l, t, r, t, r, b)
+				}
+				matrix.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
+				canvas.drawBitmap(bitmap, matrix, tilePaint)
 			}
-			matrix2!!.reset()
-			setMatrixArray(
-				srcArray,
-				0f,
-				0f,
-				tile.bitmap!!.width.toFloat(),
-				0f,
-				tile.bitmap!!.width.toFloat(),
-				tile.bitmap!!.height.toFloat(),
-				0f,
-				tile.bitmap!!.height.toFloat(),
-			)
-			if (getRequiredRotation() == ORIENTATION_0) {
-				setMatrixArray(
-					dstArray,
-					tile.vRect.left.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.bottom.toFloat(),
-				)
-			} else if (getRequiredRotation() == ORIENTATION_90) {
-				setMatrixArray(
-					dstArray,
-					tile.vRect.right.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.top.toFloat(),
-				)
-			} else if (getRequiredRotation() == ORIENTATION_180) {
-				setMatrixArray(
-					dstArray,
-					tile.vRect.right.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.top.toFloat(),
-				)
-			} else if (getRequiredRotation() == ORIENTATION_270) {
-				setMatrixArray(
-					dstArray,
-					tile.vRect.left.toFloat(),
-					tile.vRect.bottom.toFloat(),
-					tile.vRect.left.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.top.toFloat(),
-					tile.vRect.right.toFloat(),
-					tile.vRect.bottom.toFloat(),
-				)
-			}
-			matrix2!!.setPolyToPoly(srcArray, 0, dstArray, 0, 4)
-			canvas.drawBitmap(tile.bitmap!!, matrix2!!, bitmapPaint)
 			if (isDebugDrawingEnabled) {
 				canvas.drawRect(tile.vRect, debugLinePaint!!)
 			}
@@ -1120,15 +1089,22 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Convert source rect to screen rect, integer values.
+	 * Convert source rect to screen rect: each edge the whole pixel nearest to where it stands, so tiles that share
+	 * an edge of the source share it on the screen, and an image that ends at the view's edge ends on it, not a pixel
+	 * short where single precision put it a fraction inside (a 1110 px wide page on a 1220 px wide view: 1219.9999).
 	 */
 	private fun sourceToViewRect(sRect: Rect, vTarget: Rect) {
-		vTarget[
-			sourceToViewX(sRect.left.toFloat()).toInt(), sourceToViewY(sRect.top.toFloat()).toInt(),
-			sourceToViewX(
-				sRect.right.toFloat(),
-			).toInt(),
-		] = sourceToViewY(sRect.bottom.toFloat()).toInt()
+		val translate = vTranslate
+		if (translate == null) {
+			vTarget.setEmpty()
+			return
+		}
+		vTarget.set(
+			(sRect.left * scale + translate.x).roundToInt(),
+			(sRect.top * scale + translate.y).roundToInt(),
+			(sRect.right * scale + translate.x).roundToInt(),
+			(sRect.bottom * scale + translate.y).roundToInt(),
+		)
 	}
 
 	/**
@@ -1638,14 +1614,15 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Starts the decodes of the tiles waiting, as many as may run at a time: the nearest to what the view shows first
-	 * ([shownSRect]: where it was last asked to stand), of two as near the one further down an image, which is where
-	 * a reader goes on to. Called when tiles were asked for and when a decode returned, so each tile is chosen by
-	 * where the view is when its decode starts.
+	 * Starts the decodes of the tiles waiting, as many as the decoder can decode at once now: the nearest to what the
+	 * view shows first ([shownSRect]: where it was last asked to stand), of two as near the one further down an image,
+	 * which is where a reader goes on to. Called when tiles were asked for, when a decode returned and when the decoder
+	 * can decode more at once than before, so each tile is chosen by where the view is when its decode can begin, and
+	 * a place the view moves to waits for one decode under way, then for its own.
 	 */
 	private fun startTileLoads() {
 		val decoder = decoder ?: return
-		while (tileLoadsRunning < TILE_LOADS) {
+		while (tileLoadsRunning < TILE_LOADS && decoder.canStartLoad) {
 			// A tile recycled since it was asked for, of a layer the view no longer shows, is not loaded
 			waitingTiles.removeAll { tile -> (!tile.isVisible).also { if (it) tile.isLoading = false } }
 			val shown = shownSRect()
@@ -1673,6 +1650,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			fileSRect.offset(it.left, it.top)
 		}
 		tileLoadsRunning++
+		decoder.loads++
 		coroutineScope.launch {
 			try {
 				val bitmap = decodeOn(backgroundDispatcher) {
@@ -1694,6 +1672,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			} finally {
 				// Here only once the decode has returned, whatever became of its image
 				tileLoadsRunning--
+				decoder.loads--
 				startTileLoads()
 			}
 		}
@@ -1717,7 +1696,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			bitmapIsPreview = false
 			bitmapIsCached = false
 		}
-		this.decoder = RegionDecoderUse(decoder)
+		// Told on the thread that gave the decoder more to decode with; the tiles are chosen on this one
+		this.decoder = RegionDecoderUse(decoder) { coroutineScope.launch { startTileLoads() } }
 		isDecoderEnded = false
 		this.sWidth = sWidth
 		this.sHeight = sHeight
@@ -2222,6 +2202,13 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private fun createPaints() {
 		if (bitmapPaint == null) {
 			bitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).also {
+				if (colorFilter != null) {
+					it.colorFilter = colorFilter
+				}
+			}
+		}
+		if (tilePaint == null) {
+			tilePaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG).also {
 				if (colorFilter != null) {
 					it.colorFilter = colorFilter
 				}
