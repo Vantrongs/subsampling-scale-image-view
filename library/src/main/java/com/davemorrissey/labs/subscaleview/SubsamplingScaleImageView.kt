@@ -24,6 +24,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewTreeObserver
 import android.view.animation.DecelerateInterpolator
 import androidx.annotation.AnyThread
 import androidx.annotation.AttrRes
@@ -48,6 +49,7 @@ import com.davemorrissey.labs.subscaleview.internal.ScaleAndTranslate
 import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
+import com.davemorrissey.labs.subscaleview.internal.Viewport
 import com.davemorrissey.labs.subscaleview.internal.getExifOrientation
 import com.davemorrissey.labs.subscaleview.internal.isTilingEnabled
 import com.davemorrissey.labs.subscaleview.internal.panBy
@@ -204,6 +206,17 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Where a tile would be drawn at the place asked about ([drawnRect]); the main thread's, read at once
 	private val placeRect = Rect()
+
+	// What of the view reaches the screen, read anew by each question that asks it ([Viewport.read])
+	private val viewport = Viewport()
+
+	// The part of the view that reached the screen when its tiles were last refreshed, and the part that does now
+	private val refreshedExposure = RectF()
+	private val exposure = RectF()
+	private val viewportWatch = ViewTreeObserver.OnPreDrawListener {
+		lookAtViewport()
+		true
+	}
 	private var tileLoadsRunning = 0
 
 	// Whether tiles should be loaded while gestures and animations are still in progress
@@ -1097,7 +1110,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * where it stands, so tiles that share an edge of the source share it on the screen, and an image that ends at the
 	 * view's edge ends on it, not a pixel short where single precision put it a fraction inside (a 1110 px wide page on
 	 * a 1220 px wide view: 1219.9999). The one place that says where a tile is: the drawing ([drawTile]) and every
-	 * question of whether the view shows a tile ([isInViewport]) read it, so a tile counts as shown exactly where it
+	 * question of whether the screen shows a tile ([Viewport.shows]) read it, so a tile counts as shown exactly where it
 	 * draws a pixel. Told from the source rows instead, a strip whose edge stands a quarter of a pixel inside the view
 	 * counted as shown while it drew nothing, and the image waited for its decode.
 	 */
@@ -1108,20 +1121,6 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			(sRect.right * scale + translate.x).roundToInt(),
 			(sRect.bottom * scale + translate.y).roundToInt(),
 		)
-	}
-
-	/** Whether a tile drawn at [vRect] ([drawnRect]) draws any pixel of the view */
-	private fun isInViewport(vRect: Rect): Boolean =
-		!vRect.isEmpty && vRect.left < width && vRect.right > 0 && vRect.top < height && vRect.bottom > 0
-
-	/**
-	 * How far a tile drawn at [vRect] is from the view, in its pixels: under 0 for a tile the view shows any of, else
-	 * the gap between them, which is 0 for the tiles beside it.
-	 */
-	private fun gapToViewport(vRect: Rect): Int = if (isInViewport(vRect)) {
-		-1
-	} else {
-		maxOf(vRect.left - width, -vRect.right, 0) + maxOf(vRect.top - height, -vRect.bottom, 0)
 	}
 
 	/**
@@ -1251,6 +1250,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		val tiles = tileMap?.values ?: return
 		val sampleSize = minOf(fullImageSampleSize, calculateInSampleSize(scale))
 		val place = shownPlace()
+		val viewport = viewport.read(this)
+		viewport.exposure(refreshedExposure)
 
 		// Load tiles of the correct sample size that are on screen. Discard tiles off-screen, and those that are higher
 		// resolution than required, or lower res than required but not the base layer, so the base layer is always present.
@@ -1263,7 +1264,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				if (tile.sampleSize == sampleSize) {
 					// The base layer whole, also where it is the layer shown: a strip the view comes to later is there
 					// already, at the sampling asked for since
-					if (tile.sampleSize == fullImageSampleSize || tileVisible(tile, place)) {
+					if (tile.sampleSize == fullImageSampleSize || tileVisible(tile, place, viewport)) {
 						tile.isVisible = true
 						if (!tile.isLoading && (isTileOutdated || tile.bitmap == null) && load) {
 							askForTile(tile)
@@ -1309,12 +1310,50 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Whether the view shows any of a tile where it stands ([shownPlace]); every tile while it stands nowhere yet.
+	 * Whether the screen shows any of a tile where the view stands ([shownPlace]); every tile while it stands nowhere
+	 * yet.
 	 */
-	private fun tileVisible(tile: Tile, place: ScaleAndTranslate?): Boolean {
+	private fun tileVisible(tile: Tile, place: ScaleAndTranslate?, viewport: Viewport): Boolean {
 		place ?: return true
 		drawnRect(tile.sRect, place.scale, place.vTranslate, placeRect)
-		return isInViewport(placeRect)
+		return viewport.shows(placeRect)
+	}
+
+	override fun onAttachedToWindow() {
+		super.onAttachedToWindow()
+		viewTreeObserver.addOnPreDrawListener(viewportWatch)
+	}
+
+	override fun onDetachedFromWindow() {
+		viewTreeObserver.removeOnPreDrawListener(viewportWatch)
+		super.onDetachedFromWindow()
+	}
+
+	/**
+	 * Looks again at what of the view reaches the screen, before each frame of its window: an ancestor that zooms,
+	 * pans or scrolls changes it without telling the view, whose own place stays, and nothing else would ask. An image
+	 * not shown yet shows where the part seen now has its tiles (a zoom leaves less of the view to wait for), and
+	 * where the screen shows more of the view than its tiles were last refreshed for, they are refreshed; less alone
+	 * refreshes nothing, so a tile is not dropped and decoded again as a view leaves and comes back. Only while an
+	 * image in tiles has its decoder: one drawn from a whole bitmap, or with every tile in, asks nothing here.
+	 */
+	private fun lookAtViewport() {
+		if (decoder == null || tileMap == null) {
+			return
+		}
+		if (!isReadySent || !imageLoadedSent) {
+			val wasReady = isReadySent
+			val wasLoaded = imageLoadedSent
+			checkReady()
+			checkImageLoaded()
+			if (isReadySent != wasReady || imageLoadedSent != wasLoaded) {
+				invalidate()
+			}
+		}
+		viewport.read(this).exposure(exposure)
+		if (!refreshedExposure.contains(exposure)) {
+			refreshRequiredTiles(load = true)
+		}
 	}
 
 	/**
@@ -1611,8 +1650,8 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	/**
 	 * Starts the decodes of the tiles waiting, as many as the decoder can decode at once now: the nearest to what the
-	 * view shows first ([shownPlace]: where it was last asked to stand), of two as near the one further down an image,
-	 * which is where a reader goes on to. Called when tiles were asked for, when a decode returned and when the decoder
+	 * screen shows of the view first ([shownPlace]: where it was last asked to stand; [Viewport]: what of it reaches
+	 * the screen), of two as near the one further down an image, which is where a reader goes on to. Called when tiles were asked for, when a decode returned and when the decoder
 	 * can decode more at once than before, so each tile is chosen by where the view is when its decode can begin, and
 	 * a place the view moves to waits for one decode under way, then for its own.
 	 */
@@ -1622,13 +1661,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			// A tile recycled since it was asked for, of a layer the view no longer shows, is not loaded
 			waitingTiles.removeAll { tile -> (!tile.isVisible).also { if (it) tile.isLoading = false } }
 			val place = shownPlace()
+			val viewport = viewport.read(this)
 			val next = waitingTiles.minWithOrNull(
 				compareBy<Tile> {
 					if (place != null) {
 						drawnRect(it.sRect, place.scale, place.vTranslate, placeRect)
-						gapToViewport(placeRect)
+						viewport.gapTo(placeRect)
 					} else {
-						0
+						0f
 					}
 				}
 					.thenByDescending { it.sRect.top }
@@ -1765,16 +1805,17 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	}
 
 	/**
-	 * Whether the tiles of the base layer that the view shows ([shownPlace], [isInViewport]) are all loaded, as far
+	 * Whether the tiles of the base layer that the screen shows ([shownPlace], [Viewport.shows]) are all loaded, as far
 	 * as it shows any: from then on the image shows, and counts as loaded, though the rest of the layer still loads.
 	 */
 	private fun isBaseLayerShown(): Boolean {
 		val base = tileMap?.get(fullImageSampleSize) ?: return false
 		val place = shownPlace() ?: return false
+		val viewport = viewport.read(this)
 		var showsAny = false
 		for (tile in base) {
 			drawnRect(tile.sRect, place.scale, place.vTranslate, placeRect)
-			if (isInViewport(placeRect)) {
+			if (viewport.shows(placeRect)) {
 				if (tile.bitmap == null) {
 					return false
 				}
