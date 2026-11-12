@@ -62,6 +62,12 @@ public class ViewportTest {
 	@Volatile
 	private var isHeld: (Rect) -> Boolean = { false }
 	private val gates = ConcurrentHashMap<Rect, CountDownLatch>()
+
+	/** The strips let go, whose decodes pass their gate whenever they come to it */
+	private val released = ConcurrentHashMap.newKeySet<Int>()
+
+	@Volatile
+	private var isAllReleased = false
 	private val asked = CopyOnWriteArrayList<Rect>()
 	private val decoded = CopyOnWriteArrayList<Rect>()
 
@@ -336,6 +342,7 @@ public class ViewportTest {
 	private fun strip(sRect: Rect) = sRect.top / STRIP_ROWS
 
 	private fun release(strip: Int) {
+		released += strip
 		gates.entries.filter { strip(it.key) == strip }.forEach { it.value.countDown() }
 	}
 
@@ -363,6 +370,8 @@ public class ViewportTest {
 		asked.clear()
 		decoded.clear()
 		gates.clear()
+		released.clear()
+		isAllReleased = false
 		opened = null
 		decodedAtReady = null
 		onMain {
@@ -394,6 +403,7 @@ public class ViewportTest {
 	}
 
 	private fun close() {
+		isAllReleased = true
 		gates.values.forEach { it.countDown() }
 		isHeld = { false }
 		if (::view.isInitialized) {
@@ -429,6 +439,10 @@ public class ViewportTest {
 			asked += rect
 			if (isHeld(rect)) {
 				val gate = gates.getOrPut(rect) { CountDownLatch(1) }
+				// Asked for and let go before its gate was there
+				if (isAllReleased || strip(rect) in released) {
+					gate.countDown()
+				}
 				check(gate.await(20, TimeUnit.SECONDS)) { "the test did not release $rect" }
 			}
 			val bitmap = Bitmap.createBitmap(rect.width() / sampleSize, rect.height() / sampleSize, Bitmap.Config.ARGB_8888)
